@@ -452,13 +452,11 @@ void WatchRearm()
 int main(int argc, char** argv)
 {
     // DSE.exe has no console. When nobody redirects its log (tools/run.ps1 does), it goes to
-    // logs/juego.log, two folders above the exe (project/build -> Recomp/logs).
+    // juego.log in LogFolder() (config.h).
     HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
     if (err == nullptr || err == INVALID_HANDLE_VALUE || GetFileType(err) == FILE_TYPE_UNKNOWN)
     {
-        std::string logs = ExeFolder() + "/../../logs";
-        CreateDirectoryA(logs.c_str(), nullptr);
-        if (!freopen((logs + "/juego.log").c_str(), "w", stderr))
+        if (!freopen((LogFolder() + "/juego.log").c_str(), "w", stderr))
             freopen("NUL", "w", stderr);
     }
     AddVectoredExceptionHandler(1, CrashHandler);

@@ -930,7 +930,7 @@ void Click(int id, bool right)
         break;
     case kIdSave: Save(); break;
     case kIdBrowse: BrowseFolder(); break;
-    case kIdOpenLogs: OpenFolder("..\\..\\logs"); break;
+    case kIdOpenLogs: ShellExecuteW(nullptr, L"open", Wide(LogFolder()).c_str(), nullptr, nullptr, SW_SHOWNORMAL); break;
     case kIdOpenSaves: OpenFolder("user\\nand"); break;
     case kIdResetControls:
         for (int i = 0; i < kControlActionCount; i++)

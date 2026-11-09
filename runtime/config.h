@@ -10,6 +10,9 @@ int ConfigInt(const char* key, int fallback);
 float ConfigFloat(const char* key, float fallback);
 bool ConfigBool(const char* key, bool fallback);
 std::string ExeFolder();
+// Where the log goes: Recomp/logs in the development layout (exe in project/build), else
+// a logs folder next to the exe.
+std::string LogFolder();
 
 // dse.ini as lines, so saving keeps comments and keys it does not know (launcher).
 struct IniFile

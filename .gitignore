@@ -11,3 +11,4 @@
 /project/build/launcher/portada.bmp
 # Capturas de pruebas sueltas
 /*.png
+/dist/

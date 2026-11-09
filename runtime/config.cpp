@@ -35,6 +35,20 @@ bool ParseLine(const std::string& line, std::string& key, std::string& value)
 }
 } // namespace
 
+std::string LogFolder()
+{
+    char full[MAX_PATH];
+    std::string dev = ExeFolder() + "/../../logs";
+    if (GetFullPathNameA(dev.c_str(), MAX_PATH, full, nullptr))
+        dev = full;  // plain backslashes (for Explorer)
+    DWORD attr = GetFileAttributesA(dev.c_str());
+    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
+        return dev;
+    std::string local = ExeFolder() + "\\logs";
+    CreateDirectoryA(local.c_str(), nullptr);
+    return local;
+}
+
 std::string ExeFolder()
 {
     char p[MAX_PATH];

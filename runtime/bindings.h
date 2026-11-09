@@ -37,7 +37,7 @@ inline const ControlAction kControlActions[] = {
     // Glow Worm (the light), as its own tutorial texts say.
     { "agitar_nunchuk", L"Golpe cuerpo a cuerpo (agitar Nunchuk)", "F", "RB" },
     { "agitar_mando", L"Cargar la luz Glow Worm (agitar mando)", "G", "LS" },
-    { "girar", L"Girar el mando de lado", "R", "RS" },
+    { "girar", L"Fuego alternativo (girar el mando de lado)", "R", "RS" },
 };
 constexpr int kControlActionCount = int(sizeof(kControlActions) / sizeof(kControlActions[0]));
 

@@ -89,16 +89,20 @@ const Choice kChoices[] = {
     { "aspecto", L"Relación de aspecto", L"21:9 y 32:9 amplían la vista a los lados; el HUD queda en el centro.",
         { { "4:3", L"4:3 (original)" }, { "16:9", L"16:9" }, { "21:9", L"21:9 ultrapanorámico" },
           { "32:9", L"32:9 superultrapanorámico" } }, "4:3" },
+    { "mando_jugador2", L"Mando del jugador 2", L"El jugador 1 usa teclado, ratón y el mando 1 (si no es este).",
+        { { "0", L"Mando 1" }, { "1", L"Mando 2" }, { "2", L"Mando 3" }, { "3", L"Mando 4" } }, "1" },
 };
-enum { kChoiceScale, kChoiceFps, kChoiceWindow, kChoicePad, kChoiceAspect, kChoiceCount };
+enum { kChoiceScale, kChoiceFps, kChoiceWindow, kChoicePad, kChoiceAspect, kChoiceP2Pad, kChoiceCount };
 
 const Toggle kToggles[] = {
     { "pantalla_completa", L"Pantalla completa", L"Sin bordes, en el monitor de la ventana.", false },
     { "efectos_audio", L"Efectos de sonido (reverberación)", L"Los buses de efectos del juego (eco, reverb).", true },
     { "mostrar_launcher", L"Mostrar este launcher al abrir", L"Si se desactiva, mantén Mayús al abrir para verlo.", true },
     { "profundidad_campo", L"Desenfoque de profundidad (original)", L"Lo lejano se ve borroso, como en Wii. Más fuerte en 21:9 y 32:9.", false },
+    { "vibracion", L"Vibración del mando", L"La vibración del Wii Remote, en el mando de Xbox.", true },
+    { "jugador2", L"Segundo jugador (cooperativo local)", L"Un segundo Wii Remote + Nunchuk con otro mando de Xbox.", false },
 };
-enum { kToggleFullscreen, kToggleEffects, kToggleLauncher, kToggleDof, kToggleCount };
+enum { kToggleFullscreen, kToggleEffects, kToggleLauncher, kToggleDof, kToggleRumble, kToggleCoop, kToggleCount };
 
 // --- State -----------------------------------------------------------------------------
 struct Hit
@@ -576,7 +580,7 @@ void PaintHome(HDC dc, RECT area)
     Text(dc, L"RATÓN: apuntar   ·   CLIC IZQ.: disparar   ·   CLIC DER. / ESPACIO: A", c1, kText, g.smallFont,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     RECT c2{ card.left + S(16), card.top + S(28), card.right - S(16), card.top + S(52) };
-    Text(dc, L"F: golpe (Nunchuk)   ·   G: cargar la luz   ·   R: girar el mando   ·   WASD: Nunchuk   ·   INTRO: pausa", c2,
+    Text(dc, L"F: golpe (Nunchuk)   ·   G: cargar la luz   ·   R: fuego alternativo   ·   WASD: Nunchuk   ·   INTRO: pausa", c2,
         kMuted, g.smallFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 }
 
@@ -689,7 +693,12 @@ void PaintAdvanced(HDC dc, RECT area)
         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_PATH_ELLIPSIS);
     Button(dc, RECT{ x + w - S(140), y, x + w, y + S(34) }, L"ELEGIR…", kIdBrowse);
     y += S(56);
-    y = Section(dc, x, y, w, L"LAUNCHER");
+    y = Section(dc, x, y, w, L"MANDOS");
+    ToggleRow(dc, x, y, w, kToggleRumble);
+    ToggleRow(dc, x, y, w, kToggleCoop);
+    if (ToggleValue(kToggleCoop))
+        ChoiceRow(dc, x, y, w, kChoiceP2Pad);
+    y = Section(dc, x, y + S(6), w, L"LAUNCHER");
     ToggleRow(dc, x, y, w, kToggleLauncher);
     y = Section(dc, x, y + S(6), w, L"CARPETAS");
     Button(dc, RECT{ x, y, x + S(220), y + S(36) }, L"PARTIDAS GUARDADAS", kIdOpenSaves);
@@ -771,7 +780,7 @@ void Paint(HDC dc, RECT rc)
     FillAlpha(dc, panel, RGB(5, 12, 17), 185, S(18));
     Chamfer(dc, panel, S(18), CLR_NONE, kLine);
     // Pages with room to spare end with a strip of the page's picture.
-    if ((g.page == kGraphics || g.page == kAudio || g.page == kAdvanced) && HasPicture(art))
+    if ((g.page == kGraphics || g.page == kAudio) && HasPicture(art))
     {
         RECT strip{ content.left, content.bottom - S(170), content.right, content.bottom };
         DrawPictureCover(dc, art, strip, 0.5f, 0.45f, 235);

@@ -57,7 +57,8 @@ constexpr UINT kTexSrvCapacity = 16384;      // CPU-side SRVs for cached texture
 
 const char* kShaders = R"(
 struct VIn { float4 pos : POSITION; float4 nrm : NORMAL; float4 col : COLOR0; float2 tc[8] : TEXCOORD0; uint4 idx : BLENDINDICES; };
-struct V { float4 pos : SV_Position; float4 col : COLOR0; float2 tc[8] : TEXCOORD0; };
+// tc: s, t and q; the pixel shader divides by q (perspective-correct projected textures, as on GX).
+struct V { float4 pos : SV_Position; float4 col : COLOR0; float3 tc[8] : TEXCOORD0; };
 
 cbuffer Draw : register(b0)
 {
@@ -203,13 +204,13 @@ V vs_main(VIn i)
     // STQ); with dual texture it can be normalized and goes through a post matrix.
     // (A local array: outputs cannot be indexed by a loop variable.)
     uint numTexGens = chan.z;
-    float2 tcs[8];
+    float3 tcs[8];
     float2 itc[8] = i.tc;
     for (uint t = 0; t < 8; t++)
     {
         if (t >= numTexGens)
         {
-            tcs[t] = itc[t];
+            tcs[t] = float3(itc[t], 1);
             continue;
         }
         uint info = GetU2(texgen, t);
@@ -217,13 +218,13 @@ V vs_main(VIn i)
         uint type = (info >> 4) & 7, source = (info >> 7) & 31;
         if (type == 2 || type == 3)  // color texgen
         {
-            tcs[t] = o.col.rg;
+            tcs[t] = float3(o.col.rg, 1);
             continue;
         }
         if (type == 1)  // emboss: the source texgen's coordinates
         {
             uint from = (info >> 12) & 7;
-            tcs[t] = from < t ? tcs[from] : float2(0, 0);
+            tcs[t] = from < t ? tcs[from] : float3(0, 0, 1);
             continue;
         }
         float3 src = float3(0, 0, 1);
@@ -246,9 +247,9 @@ V vs_main(VIn i)
             stq = true;
         }
         float q = stq && r.z != 0 ? r.z : 1.0;
-        tcs[t] = r.xy / q;
-        if (info >> 31)  // widened camera projection (see FillConstants)
-            tcs[t].x = 0.5 + (tcs[t].x - 0.5) * vp1.z;
+        tcs[t] = float3(r.xy, q);
+        if (info >> 31)  // widened camera projection (see FillConstants): u/q around 0.5
+            tcs[t].x = 0.5 * q + (tcs[t].x - 0.5 * q) * vp1.z;
     }
     o.tc = tcs;
     return o;
@@ -405,7 +406,9 @@ float4 PsBody(V i, inout float zc)
         uint order = Get2(tevOrder, s >> 1) >> ((s & 1) * 12);
         uint map = order & 7, coord = (order >> 3) & 7, chan = (order >> 7) & 7;
         uint aw0 = Get4(tevAlpha, s);
-        float4 t = ((order >> 6) & 1) ? Swap(SampleMap(map, i.tc[coord]), (aw0 >> 2) & 3) : float4(0, 0, 0, 0);
+        float3 tq = i.tc[coord];
+        float2 uv = tq.xy / (abs(tq.z) > 1e-7 ? tq.z : 1e-7);
+        float4 t = ((order >> 6) & 1) ? Swap(SampleMap(map, uv), (aw0 >> 2) & 3) : float4(0, 0, 0, 0);
         lastTex = ((order >> 6) & 1) ? t : float4(1, 1, 1, 1);
         float4 ras = chan == 7 ? float4(0, 0, 0, 0) : Swap(i.col, aw0 & 3);
         uint ks = Get2(ksel, s >> 1) >> ((s & 1) * 10);
@@ -2437,7 +2440,28 @@ float WideFactor(const GxVertex* v, uint32_t count)
                 GxXfFloat(0x101D) - 342, GxXfFloat(0x101E) - 342, ((g_gx.bp[0] >> 10) & 15) + 1);
         }
     }
-    return (lo <= -0.97f && hi >= 0.97f) ? 1.0f : -g_wideK;  // 2D interface: see the vertex shader
+    if (lo <= -0.97f && hi >= 0.97f)
+    {
+        // A whole-screen picture (videos, the safety screen, title cards): a big texture from
+        // memory with color writes on. It keeps its 16:9 shape in the middle; fades, tints
+        // (small textures) and depth-only passes keep covering the whole width.
+        if ((g_gx.bp[0x41] >> 3) & 1)
+        {
+            uint32_t stages = ((g_gx.bp[0] >> 10) & 15) + 1;
+            for (uint32_t st = 0; st < stages; st++)
+            {
+                uint32_t order = g_gx.bp[0x28 + st / 2] >> ((st & 1) * 12);
+                if (!((order >> 6) & 1))
+                    continue;
+                uint32_t map = order & 7;
+                uint32_t img = g_gx.bp[(map < 4 ? 0x88 : 0xA8) + (map & 3)];
+                if ((img & 0x3FF) + 1 >= 256 || ((img >> 10) & 0x3FF) + 1 >= 256)
+                    return g_wideK;
+            }
+        }
+        return 1.0f;
+    }
+    return -g_wideK;  // 2D interface: see the vertex shader
 }
 
 void GxBackendDraw(uint32_t primitive, const GxVertex* v, uint32_t count)
@@ -3140,7 +3164,8 @@ void GxBackendCopyToXfb(bool clear)
     static const uint32_t every = getenv("DSE_SHOT_EVERY") ? std::max(1, atoi(getenv("DSE_SHOT_EVERY"))) : 60;
     g_frameDrawCount = 0;
     g_suspPos = 0;
-    bool shot = shots && (++g_frame % every) == 0;
+    static const uint32_t shotFrom = getenv("DSE_SHOT_FROM") ? uint32_t(atoi(getenv("DSE_SHOT_FROM"))) : 0;
+    bool shot = shots && (++g_frame % every) == 0 && g_frame >= shotFrom;
     if (!shots)
         g_frame++;
 

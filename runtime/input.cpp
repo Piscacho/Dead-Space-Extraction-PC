@@ -34,9 +34,9 @@ constexpr uint32_t kZ = 0x2000, kC = 0x4000;
 constexpr uint32_t kSampleSize = 0xF0;
 constexpr uint32_t kDevNunchuk = 1;  // WPAD device types: 0 remote, 1 + Nunchuk, 2 + Classic
 
-uint32_t g_prevHold = 0;
-float g_prevPos[2] = { 0, 0 };
-float g_padPointer[2] = { 0, 0 };  // pointer moved by the gamepad's right stick
+uint32_t g_prevHold[2] = {};  // per player
+float g_prevPos[2][2] = {};
+float g_padPointer[2][2] = {};  // per player: pointer moved by the gamepad's right stick
 
 void StoreF(uint32_t addr, float v)
 {
@@ -108,7 +108,7 @@ struct Motion
         memcpy(out, base, sizeof(base));
     }
 };
-Motion g_remoteMotion, g_nunchukMotion;
+Motion g_remoteMotion[2], g_nunchukMotion[2];  // per player
 
 void StoreAcc(uint32_t addr, const float acc[3], float prev[3])
 {
@@ -157,13 +157,28 @@ const BindingTable& Bindings()
 
 void Apply(int action, struct HostInput& in);
 
-HostInput ReadHost()
+// Local co-op: jugador2 = 1 in dse.ini adds a second Wii Remote + Nunchuk on channel 1,
+// played with the Xbox controller mando_jugador2 (0-3, default 1, i.e. the second one).
+// Player 1 keeps keyboard, mouse and controller mando_jugador1 (default 0; -1 none, and none
+// when both settings name the same controller).
+bool SecondPlayer() { static const bool on = ConfigBool("jugador2", false); return on; }
+int PadOf(int player)
+{
+    static const int p2 = std::clamp(ConfigInt("mando_jugador2", 1), 0, 3);
+    static const int p1 = [] {
+        int v = ConfigInt("mando_jugador1", 0);
+        return (v < 0 || v > 3 || (SecondPlayer() && v == p2)) ? -1 : v;
+    }();
+    return player == 0 ? p1 : (SecondPlayer() ? p2 : -1);
+}
+
+HostInput ReadHost(int player)
 {
     HostInput in;
     HWND window = (HWND)VideoGetWindow();
     bool focused = window && GetForegroundWindow() == window;
 
-    if (focused)
+    if (focused && player == 0)
     {
         // Mouse: pointer over the window's client area.
         POINT p;
@@ -188,7 +203,8 @@ HostInput ReadHost()
 
     // Gamepad (works without focus, like most PC games with controllers).
     XINPUT_STATE xs{};
-    if (XInputGetState(0, &xs) == ERROR_SUCCESS)
+    int pad = PadOf(player);
+    if (pad >= 0 && XInputGetState(DWORD(pad), &xs) == ERROR_SUCCESS)
     {
         const XINPUT_GAMEPAD& g = xs.Gamepad;
         uint32_t held = g.wButtons | (g.bLeftTrigger > 64 ? 0x10000u : 0u) | (g.bRightTrigger > 64 ? 0x20000u : 0u);
@@ -204,16 +220,17 @@ HostInput ReadHost()
         if (rx != 0.0f || ry != 0.0f)
         {
             static const float speed = 0.035f * ConfigFloat("sens_mando", 1.0f);
-            g_padPointer[0] = std::fmax(-1.0f, std::fmin(1.0f, g_padPointer[0] + rx * speed));
-            g_padPointer[1] = std::fmax(-1.0f, std::fmin(1.0f, g_padPointer[1] - ry * speed));
-            in.pointer[0] = g_padPointer[0];
-            in.pointer[1] = g_padPointer[1];
+            float* pp = g_padPointer[player];
+            pp[0] = std::fmax(-1.0f, std::fmin(1.0f, pp[0] + rx * speed));
+            pp[1] = std::fmax(-1.0f, std::fmin(1.0f, pp[1] - ry * speed));
+            in.pointer[0] = pp[0];
+            in.pointer[1] = pp[1];
             in.pointerValid = true;
         }
         else if (!in.pointerValid)
         {
-            in.pointer[0] = g_padPointer[0];
-            in.pointer[1] = g_padPointer[1];
+            in.pointer[0] = g_padPointer[player][0];
+            in.pointer[1] = g_padPointer[player][1];
             in.pointerValid = true;
         }
     }
@@ -249,10 +266,10 @@ PPC_FUNC(sub_803FFE98)  // KPADSetConnectCallback(chan, callback)
 {
     uint32_t chan = ctx.r3.u32, callback = ctx.r4.u32;
     __imp__sub_803FFE98(ctx, base);
-    if (chan == 0 && callback)
+    if ((chan == 0 || (chan == 1 && SecondPlayer())) && callback)
     {
-        LOG("[input] remote 0 connected (callback 0x%08X)", callback);
-        QueueGuestCallback(callback, 0, 0);
+        LOG("[input] remote %u connected (callback 0x%08X)", chan, callback);
+        QueueGuestCallback(callback, chan, 0);
     }
 }
 
@@ -261,11 +278,32 @@ PPC_FUNC(sub_803EECC8)  // WPADSetExtensionCallback(chan, callback): returns the
 {
     uint32_t chan = ctx.r3.u32, callback = ctx.r4.u32;
     __imp__sub_803EECC8(ctx, base);
-    if (chan == 0 && callback)
+    if ((chan == 0 || (chan == 1 && SecondPlayer())) && callback)
     {
-        LOG("[input] Nunchuk plugged into remote 0 (callback 0x%08X)", callback);
-        QueueGuestCallback(callback, 0, kDevNunchuk);
+        LOG("[input] Nunchuk plugged into remote %u (callback 0x%08X)", chan, callback);
+        QueueGuestCallback(callback, chan, kDevNunchuk);
     }
+}
+
+// WPADControlMotor(chan, command): the remote's rumble (1 on, 0 off) goes to the Xbox
+// controller of that player. vibracion = 0 in dse.ini turns it off. Returns nothing.
+PPC_FUNC(sub_803EF0A0)
+{
+    static const bool enabled = ConfigBool("vibracion", true);
+    uint32_t chan = ctx.r3.u32, on = ctx.r4.u32;
+    if (!enabled || chan > 1)
+        return;
+    int pad = PadOf(int(chan));
+    if (pad < 0)
+        return;
+    static uint32_t state[2] = { 2, 2 };
+    if (state[chan] == on)
+        return;
+    state[chan] = on;
+    XINPUT_VIBRATION v{};
+    v.wLeftMotorSpeed = on ? 30000 : 0;   // the remote has one small motor: mostly the light one
+    v.wRightMotorSpeed = on ? 45000 : 0;
+    XInputSetState(DWORD(pad), &v);
 }
 
 // KPADRead(chan, samples, max): returns the number of samples written.
@@ -278,7 +316,7 @@ PPC_FUNC(sub_803FEF18)
         return;
     }
     memset(g_base + buf, 0, kSampleSize);
-    if (chan != 0)
+    if (chan > 1 || (chan == 1 && !SecondPlayer()))
     {
         Store8(buf + 0x5D, uint8_t(-1));  // WPAD_ERR_NO_CONTROLLER
         ctx.r3.s64 = 0;
@@ -292,7 +330,10 @@ PPC_FUNC(sub_803FEF18)
         LOG("[input] KPADRead: channel 0 = Wii Remote + Nunchuk (mouse, keyboard, XInput)");
     }
 
-    HostInput in = ReadHost();
+    const int player = int(chan);
+    HostInput in = ReadHost(player);
+    if (player == 0)  // the test helpers are player 1's
+    {
     // DSE_AUTOPRESS=1 (testing): press A for 6 reads out of every 120; =B presses B (the
     // Zapper trigger), =AB alternates A and B.
     // DSE_AUTOPRESS_STOP=<s> stops pressing after that many seconds; DSE_AUTOPOINT_AFTER=<s>
@@ -372,29 +413,31 @@ PPC_FUNC(sub_803FEF18)
             }
         }
     }
+    }
     uint32_t hold = in.buttons;
     Store32(buf + 0x00, hold);
-    Store32(buf + 0x04, hold & ~g_prevHold);   // pressed this frame
-    Store32(buf + 0x08, g_prevHold & ~hold);   // released this frame
-    g_prevHold = hold;
+    Store32(buf + 0x04, hold & ~g_prevHold[player]);   // pressed this frame
+    Store32(buf + 0x08, g_prevHold[player] & ~hold);   // released this frame
+    g_prevHold[player] = hold;
 
     // Accelerometer at rest, pointing at the screen: gravity along -y.
     float acc[3];
-    g_remoteMotion.Update(in.shakeRemote, in.tilt, acc);
-    StoreAcc(buf + 0x0C, acc, g_remoteMotion.prev);
+    Motion& rm = g_remoteMotion[player];
+    rm.Update(in.shakeRemote, in.tilt, acc);
+    StoreAcc(buf + 0x0C, acc, rm.prev);
 
     // Pointer and its change since the last read.
     StoreF(buf + 0x20, in.pointer[0]);
     StoreF(buf + 0x24, in.pointer[1]);
-    float vx = in.pointer[0] - g_prevPos[0], vy = in.pointer[1] - g_prevPos[1];
+    float vx = in.pointer[0] - g_prevPos[player][0], vy = in.pointer[1] - g_prevPos[player][1];
     StoreF(buf + 0x28, vx);
     StoreF(buf + 0x2C, vy);
     StoreF(buf + 0x30, std::sqrt(vx * vx + vy * vy));
-    g_prevPos[0] = in.pointer[0];
-    g_prevPos[1] = in.pointer[1];
+    g_prevPos[player][0] = in.pointer[0];
+    g_prevPos[player][1] = in.pointer[1];
     // Horizon (the sensor bar dots' direction): level, or rolled 90 degrees when tilted.
-    StoreF(buf + 0x34, std::cos(g_remoteMotion.tilt * 1.5707963f));
-    StoreF(buf + 0x38, std::sin(g_remoteMotion.tilt * 1.5707963f));
+    StoreF(buf + 0x34, std::cos(rm.tilt * 1.5707963f));
+    StoreF(buf + 0x38, std::sin(rm.tilt * 1.5707963f));
     StoreF(buf + 0x48, 1.0f);  // distance to the sensor bar (roughly 1 m)
 
     Store8(buf + 0x5C, kDevNunchuk);                // remote + Nunchuk
@@ -406,8 +449,9 @@ PPC_FUNC(sub_803FEF18)
     StoreF(buf + 0x60, in.stick[0]);
     StoreF(buf + 0x64, in.stick[1]);
     float nacc[3];
-    g_nunchukMotion.Update(in.shakeNunchuk, false, nacc);
-    StoreAcc(buf + 0x68, nacc, g_nunchukMotion.prev);
+    Motion& nm = g_nunchukMotion[player];
+    nm.Update(in.shakeNunchuk, false, nacc);
+    StoreAcc(buf + 0x68, nacc, nm.prev);
     ctx.r3.s64 = 1;
 }
 

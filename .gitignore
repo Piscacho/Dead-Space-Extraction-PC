@@ -1,0 +1,13 @@
+# Generado o propiedad del juego (no se versiona)
+/dol/
+/ppc/
+/logs/
+/recomp.log
+# XenonRecomp tiene su propio repositorio; nuestros cambios están en xenonrecomp_dse.diff
+/XenonRecomp/
+# Compilación
+/project/build/*
+!/project/build/launcher/
+/project/build/launcher/portada.bmp
+# Capturas de pruebas sueltas
+/*.png

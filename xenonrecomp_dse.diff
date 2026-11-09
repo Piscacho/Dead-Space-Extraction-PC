@@ -1,0 +1,1250 @@
+diff --git a/XenonAnalyse/main.cpp b/XenonAnalyse/main.cpp
+index d08371e..573adce 100644
+--- a/XenonAnalyse/main.cpp
++++ b/XenonAnalyse/main.cpp
+@@ -30,6 +30,9 @@ void ReadTable(Image& image, SwitchTable& table)
+     pOffset = insn.operands[1] << 16;
+ 
+     ppc::Disassemble(code + 1, table.base + 4, insn);
++    // GH:WoR: variante lis / rlwinm / addi (addi en la 3a instruccion)
++    if (insn.opcode != nullptr && insn.opcode->id == PPC_INST_RLWINM)
++        ppc::Disassemble(code + 2, table.base + 8, insn);
+     pOffset += insn.operands[2];
+ 
+     if (table.type == SWITCH_ABSOLUTE)
+@@ -260,6 +263,16 @@ int main(int argc, char** argv)
+         PPC_INST_BCTR,
+     };
+ 
++    uint32_t absoluteSwitch2[] =
++    {
++        PPC_INST_LIS,
++        PPC_INST_RLWINM,
++        PPC_INST_ADDI,
++        PPC_INST_LWZX,
++        PPC_INST_MTCTR,
++        PPC_INST_BCTR,
++    };
++
+     uint32_t computedSwitch[] =
+     {
+         PPC_INST_LIS,
+@@ -297,6 +310,7 @@ int main(int argc, char** argv)
+ 
+     println("# ---- ABSOLUTE JUMPTABLE ----");
+     scanPattern(absoluteSwitch, std::size(absoluteSwitch), SWITCH_ABSOLUTE);
++    scanPattern(absoluteSwitch2, std::size(absoluteSwitch2), SWITCH_ABSOLUTE);
+ 
+     println("# ---- COMPUTED JUMPTABLE ----");
+     scanPattern(computedSwitch, std::size(computedSwitch), SWITCH_COMPUTED);
+diff --git a/XenonRecomp/CMakeLists.txt b/XenonRecomp/CMakeLists.txt
+index f5db6d1..d6bcd43 100644
+--- a/XenonRecomp/CMakeLists.txt
++++ b/XenonRecomp/CMakeLists.txt
+@@ -5,7 +5,8 @@ project("XenonRecomp")
+ add_executable(XenonRecomp 
+     "main.cpp" 
+     "recompiler.cpp"
+-    "test_recompiler.cpp" 
++    "gekko.cpp"
++    "test_recompiler.cpp"
+     "recompiler_config.cpp")
+ 
+ target_precompile_headers(XenonRecomp PUBLIC "pch.h")
+diff --git a/XenonRecomp/gekko.cpp b/XenonRecomp/gekko.cpp
+new file mode 100644
+index 0000000..d70b772
+--- /dev/null
++++ b/XenonRecomp/gekko.cpp
+@@ -0,0 +1,476 @@
++// Gekko/Broadway (GameCube/Wii) instructions for XenonRecomp.
++//
++// On the Wii, primary opcode 4 holds the paired-single instructions (on the Xbox 360 it is VMX),
++// and opcodes 56/57/60/61 are the quantized loads/stores psq_l, psq_lu, psq_st, psq_stu.
++// Each FPR holds two values: ps0 is ctx.fN.f64 and ps1 is ctx.ps1[N].
++// The quantization registers GQR0-7 are SPRs 912-919, stored in ctx.spr[912..919].
++//
++// Semantics follow the Gekko user manual and Dolphin's interpreter.
++// The emitter assumes registers live in ctx (all *_as_local options off).
++
++#include "pch.h"
++#include "recompiler.h"
++
++namespace
++{
++    struct Fields
++    {
++        uint32_t word;
++        uint32_t d() const { return (word >> 21) & 31; }
++        uint32_t a() const { return (word >> 16) & 31; }
++        uint32_t b() const { return (word >> 11) & 31; }
++        uint32_t c() const { return (word >> 6) & 31; }
++        bool rc() const { return word & 1; }
++    };
++
++    std::string ps0(uint32_t n) { return fmt::format("ctx.f{}.f64", n); }
++    std::string ps1(uint32_t n) { return fmt::format("ctx.ps1[{}]", n); }
++    std::string gpr(uint32_t n) { return fmt::format("ctx.r{}.u32", n); }
++}
++
++bool Recompiler::IsGekkoInstruction(uint32_t word)
++{
++    uint32_t op = word >> 26;
++    return op == 4 || op == 56 || op == 57 || op == 60 || op == 61;
++}
++
++bool Recompiler::RecompileGekko(uint32_t word, uint32_t address)
++{
++    Fields i{ word };
++    uint32_t op = word >> 26;
++
++    // psq_l / psq_lu / psq_st / psq_stu: d(rA) with a 12-bit signed displacement.
++    if (op != 4)
++    {
++        int32_t disp = int32_t(word << 20) >> 20;
++        uint32_t w = (word >> 15) & 1;
++        uint32_t q = (word >> 12) & 7;
++        bool update = op == 57 || op == 61;
++        bool store = op >= 60;
++        q += 912; // GQR0-7 are SPRs 912-919
++        println("\t// {} f{}, {}(r{}), {}, qr{}", store ? (update ? "psq_stu" : "psq_st") : (update ? "psq_lu" : "psq_l"),
++            i.d(), disp, i.a(), w, q - 912);
++        println("\t{{");
++        if (i.a() == 0 && !update)
++            println("\t\tuint32_t ea = {}u;", uint32_t(disp));
++        else
++            println("\t\tuint32_t ea = {} + {}u;", gpr(i.a()), uint32_t(disp));
++        if (store)
++        {
++            println("\t\tPPC_PSQ_STORE(ea, ctx.spr[{}], 0, {});", q, ps0(i.d()));
++            if (!w)
++                println("\t\tPPC_PSQ_STORE(ea, ctx.spr[{}], 1, {});", q, ps1(i.d()));
++        }
++        else
++        {
++            println("\t\tdouble v0 = PPC_PSQ_LOAD(ea, ctx.spr[{}], 0);", q);
++            println("\t\tdouble v1 = {};", w ? "1.0" : fmt::format("PPC_PSQ_LOAD(ea, ctx.spr[{}], 1)", q));
++            println("\t\t{} = v0; {} = v1;", ps0(i.d()), ps1(i.d()));
++        }
++        if (update)
++            println("\t\t{} = ea;", gpr(i.a()));
++        println("\t}}");
++        return true;
++    }
++
++    uint32_t x5 = (word >> 1) & 31;
++    uint32_t x6 = (word >> 1) & 63;
++    uint32_t x10 = (word >> 1) & 1023;
++    uint32_t d = i.d(), a = i.a(), b = i.b(), c = i.c();
++
++    // Arithmetic in single precision: compute both halves into temporaries first,
++    // since the destination may also be a source.
++    auto pair = [&](const char* name, const std::string& r0, const std::string& r1)
++        {
++            println("\t// {} f{}, f{}, f{}, f{}", name, d, a, b, c);
++            println("\t{{");
++            println("\t\tdouble t0 = double(float({}));", r0);
++            println("\t\tdouble t1 = double(float({}));", r1);
++            println("\t\t{} = t0; {} = t1;", ps0(d), ps1(d));
++            println("\t}}");
++            return true;
++        };
++
++    switch (x5)
++    {
++    case 18: return pair("ps_div", ps0(a) + " / " + ps0(b), ps1(a) + " / " + ps1(b));
++    case 20: return pair("ps_sub", ps0(a) + " - " + ps0(b), ps1(a) + " - " + ps1(b));
++    case 21: return pair("ps_add", ps0(a) + " + " + ps0(b), ps1(a) + " + " + ps1(b));
++    case 23:
++        return pair("ps_sel", fmt::format("{} >= 0.0 ? {} : {}", ps0(a), ps0(c), ps0(b)),
++            fmt::format("{} >= 0.0 ? {} : {}", ps1(a), ps1(c), ps1(b)));
++    case 24: return pair("ps_res", "1.0 / " + ps0(b), "1.0 / " + ps1(b));
++    case 25: return pair("ps_mul", ps0(a) + " * " + ps0(c), ps1(a) + " * " + ps1(c));
++    case 26: return pair("ps_rsqrte", "1.0 / sqrt(" + ps0(b) + ")", "1.0 / sqrt(" + ps1(b) + ")");
++    case 28: return pair("ps_msub", ps0(a) + " * " + ps0(c) + " - " + ps0(b), ps1(a) + " * " + ps1(c) + " - " + ps1(b));
++    case 29: return pair("ps_madd", ps0(a) + " * " + ps0(c) + " + " + ps0(b), ps1(a) + " * " + ps1(c) + " + " + ps1(b));
++    case 30: return pair("ps_nmsub", "-(" + ps0(a) + " * " + ps0(c) + " - " + ps0(b) + ")", "-(" + ps1(a) + " * " + ps1(c) + " - " + ps1(b) + ")");
++    case 31: return pair("ps_nmadd", "-(" + ps0(a) + " * " + ps0(c) + " + " + ps0(b) + ")", "-(" + ps1(a) + " * " + ps1(c) + " + " + ps1(b) + ")");
++    case 10: return pair("ps_sum0", ps0(a) + " + " + ps1(b), ps1(c));
++    case 11: return pair("ps_sum1", ps0(c), ps0(a) + " + " + ps1(b));
++    case 12: return pair("ps_muls0", ps0(a) + " * " + ps0(c), ps1(a) + " * " + ps0(c));
++    case 13: return pair("ps_muls1", ps0(a) + " * " + ps1(c), ps1(a) + " * " + ps1(c));
++    case 14: return pair("ps_madds0", ps0(a) + " * " + ps0(c) + " + " + ps0(b), ps1(a) + " * " + ps0(c) + " + " + ps1(b));
++    case 15: return pair("ps_madds1", ps0(a) + " * " + ps1(c) + " + " + ps0(b), ps1(a) + " * " + ps1(c) + " + " + ps1(b));
++    default: break;
++    }
++
++    // Indexed quantized loads/stores: (rA|0) + rB, with W and I in different bits.
++    if (x6 == 6 || x6 == 7 || x6 == 38 || x6 == 39)
++    {
++        uint32_t w = (word >> 10) & 1;
++        uint32_t q = (word >> 7) & 7;
++        bool update = x6 >= 38;
++        bool store = x6 == 7 || x6 == 39;
++        q += 912; // GQR0-7 are SPRs 912-919
++        println("\t// {} f{}, r{}, r{}, {}, qr{}", store ? (update ? "psq_stux" : "psq_stx") : (update ? "psq_lux" : "psq_lx"),
++            d, a, b, w, q - 912);
++        println("\t{{");
++        if (a == 0 && !update)
++            println("\t\tuint32_t ea = {};", gpr(b));
++        else
++            println("\t\tuint32_t ea = {} + {};", gpr(a), gpr(b));
++        if (store)
++        {
++            println("\t\tPPC_PSQ_STORE(ea, ctx.spr[{}], 0, {});", q, ps0(d));
++            if (!w)
++                println("\t\tPPC_PSQ_STORE(ea, ctx.spr[{}], 1, {});", q, ps1(d));
++        }
++        else
++        {
++            println("\t\tdouble v0 = PPC_PSQ_LOAD(ea, ctx.spr[{}], 0);", q);
++            println("\t\tdouble v1 = {};", w ? "1.0" : fmt::format("PPC_PSQ_LOAD(ea, ctx.spr[{}], 1)", q));
++            println("\t\t{} = v0; {} = v1;", ps0(d), ps1(d));
++        }
++        if (update)
++            println("\t\t{} = ea;", gpr(a));
++        println("\t}}");
++        return true;
++    }
++
++    // Moves without rounding.
++    auto move = [&](const char* name, const std::string& r0, const std::string& r1)
++        {
++            println("\t// {} f{}, f{}, f{}", name, d, a, b);
++            println("\t{{");
++            println("\t\tdouble t0 = {};", r0);
++            println("\t\tdouble t1 = {};", r1);
++            println("\t\t{} = t0; {} = t1;", ps0(d), ps1(d));
++            println("\t}}");
++            return true;
++        };
++
++    // Floating-point compare into a CR field (crfD is bits 6-8).
++    auto compare = [&](const char* name, const std::string& l, const std::string& r)
++        {
++            uint32_t crf = (word >> 23) & 7;
++            println("\t// {} cr{}, f{}, f{}", name, crf, a, b);
++            println("\tctx.cr{}.compare({}, {});", crf, l, r);
++            return true;
++        };
++
++    switch (x10)
++    {
++    case 0: return compare("ps_cmpu0", ps0(a), ps0(b));
++    case 32: return compare("ps_cmpo0", ps0(a), ps0(b));
++    case 64: return compare("ps_cmpu1", ps1(a), ps1(b));
++    case 96: return compare("ps_cmpo1", ps1(a), ps1(b));
++    case 40: return move("ps_neg", "-" + ps0(b), "-" + ps1(b));
++    case 72: return move("ps_mr", ps0(b), ps1(b));
++    case 136: return move("ps_nabs", "-fabs(" + ps0(b) + ")", "-fabs(" + ps1(b) + ")");
++    case 264: return move("ps_abs", "fabs(" + ps0(b) + ")", "fabs(" + ps1(b) + ")");
++    case 528: return move("ps_merge00", ps0(a), ps0(b));
++    case 560: return move("ps_merge01", ps0(a), ps1(b));
++    case 592: return move("ps_merge10", ps1(a), ps0(b));
++    case 624: return move("ps_merge11", ps1(a), ps1(b));
++    case 1014:
++        // dcbz_l: clear a 32-byte line of the locked cache.
++        println("\t// dcbz_l r{}, r{}", a, b);
++        if (a == 0)
++            println("\tmemset(base + ({} & ~31u), 0, 32);", gpr(b));
++        else
++            println("\tmemset(base + (({} + {}) & ~31u), 0, 32);", gpr(a), gpr(b));
++        return true;
++    default:
++        break;
++    }
++
++    fmt::println("Unrecognized Gekko instruction {:08X} at 0x{:X}", word, address);
++    return false;
++}
++
++namespace
++{
++    // CR bit b lives in field b/4: 0 lt, 1 gt, 2 eq, 3 so.
++    std::string crbit(uint32_t b)
++    {
++        static const char* names[] = { "lt", "gt", "eq", "so" };
++        return fmt::format("ctx.cr{}.{}", b / 4, names[b % 4]);
++    }
++
++    int32_t simm16(uint32_t word) { return int16_t(word & 0xFFFF); }
++
++    std::string rotlMask(uint32_t mb, uint32_t me)
++    {
++        uint32_t mask = mb <= me ? ((0xFFFFFFFFu >> mb) & (0xFFFFFFFFu << (31 - me)))
++                                 : ((0xFFFFFFFFu >> mb) | (0xFFFFFFFFu << (31 - me)));
++        return fmt::format("0x{:08X}u", mask);
++    }
++}
++
++bool Recompiler::RecompileWiiExtra(uint32_t word, uint32_t address)
++{
++    uint32_t op = word >> 26;
++    uint32_t rd = (word >> 21) & 31, ra = (word >> 16) & 31, rb = (word >> 11) & 31;
++    uint32_t xo = (word >> 1) & 1023;
++    auto r = [](uint32_t n) { return fmt::format("ctx.r{}", n); };
++    auto f = [](uint32_t n) { return fmt::format("ctx.f{}", n); };
++    auto eaDisp = [&](uint32_t base, int32_t disp)
++        {
++            return base == 0 ? fmt::format("{}u", uint32_t(disp)) : fmt::format("{}.u32 + {}u", r(base), uint32_t(disp));
++        };
++    auto eaIndexed = [&]()
++        {
++            return ra == 0 ? fmt::format("{}.u32", r(rb)) : fmt::format("{}.u32 + {}.u32", r(ra), r(rb));
++        };
++
++    // Condition register logic (opcode 19).
++    if (op == 19)
++    {
++        const char* expr = nullptr;
++        switch (xo)
++        {
++        case 257: expr = "{a} & {b}"; break;          // crand
++        case 129: expr = "{a} & !{b}"; break;         // crandc
++        case 289: expr = "!({a} ^ {b})"; break;       // creqv / crset
++        case 225: expr = "!({a} & {b})"; break;       // crnand
++        case 33:  expr = "!({a} | {b})"; break;       // crnor / crnot
++        case 449: expr = "{a} | {b}"; break;          // cror / crmove
++        case 417: expr = "{a} | !{b}"; break;         // crorc
++        case 193: expr = "{a} ^ {b}"; break;          // crxor / crclr
++        default: break;
++        }
++        if (expr != nullptr)
++        {
++            std::string e = fmt::format(fmt::runtime(expr), fmt::arg("a", crbit(ra)), fmt::arg("b", crbit(rb)));
++            println("\t{} = uint8_t({});", crbit(rd), e);
++            return true;
++        }
++        if (xo == 0) // mcrf
++        {
++            println("\tctx.cr{} = ctx.cr{};", rd >> 2, ra >> 2);
++            return true;
++        }
++        if (xo == 150) // isync
++            return true;
++        if (xo == 50) // rfi: only in SDK exception handlers, which the runtime replaces
++        {
++            println("\treturn;");
++            return true;
++        }
++    }
++
++    if (op == 63)
++    {
++        if (xo == 32) // fcmpo: same result as fcmpu for our purposes
++        {
++            println("\tctx.cr{}.compare({}.f64, {}.f64);", rd >> 2, f(ra), f(rb));
++            return true;
++        }
++        if (xo == 14) // fctiw: round with the current mode (nearest)
++        {
++            println("\t{}.s64 = ({}.f64 > double(INT_MAX)) ? INT_MAX : ({}.f64 < double(INT_MIN)) ? INT_MIN : int32_t(std::nearbyint({}.f64));",
++                f(rd), f(rb), f(rb), f(rb));
++            return true;
++        }
++        if (xo == 64) // mcrfs
++        {
++            println("\tctx.cr{}.lt = ctx.cr{}.gt = ctx.cr{}.eq = ctx.cr{}.so = 0;", rd >> 2, rd >> 2, rd >> 2, rd >> 2);
++            return true;
++        }
++        if (xo == 70 || xo == 38 || xo == 134) // mtfsb0, mtfsb1, mtfsfi: exception/rounding bits, ignored
++            return true;
++    }
++
++    if (op == 23) // rlwnm
++    {
++        uint32_t mb = (word >> 6) & 31, me = (word >> 1) & 31;
++        println("\t{}.u64 = __builtin_rotateleft32({}.u32, {}.u8 & 0x1F) & {};", r(ra), r(rd), r(rb), rotlMask(mb, me));
++        if (word & 1)
++            println("\tctx.cr0.compare<int32_t>({}.s32, 0, ctx.xer);", r(ra));
++        return true;
++    }
++
++    if (op == 46 || op == 47) // lmw / stmw
++    {
++        println("\t{{");
++        println("\t\tuint32_t ea = {};", eaDisp(ra, simm16(word)));
++        for (uint32_t n = rd; n < 32; n++)
++        {
++            if (op == 46)
++                println("\t\t{}.u64 = PPC_LOAD_U32(ea + {}u);", r(n), (n - rd) * 4);
++            else
++                println("\t\tPPC_STORE_U32(ea + {}u, {}.u32);", (n - rd) * 4, r(n));
++        }
++        println("\t}}");
++        return true;
++    }
++
++    if (op == 3) // twi
++    {
++        println("\tif (PPC_TRAP_TEST({}, {}.s32, {})) PPC_TRAP(0x{:X});", rd, r(ra), simm16(word), address);
++        return true;
++    }
++
++    if (op == 17) // sc
++    {
++        println("\tPPC_SYSCALL(0x{:X});", address);
++        return true;
++    }
++
++    if (op == 31)
++    {
++        uint32_t spr = ((word >> 16) & 31) | (((word >> 11) & 31) << 5);
++        switch (xo)
++        {
++        case 467: // mtspr
++            if (spr == 1)
++            {
++                println("\tctx.xer.so = ({}.u32 >> 31) & 1; ctx.xer.ov = ({}.u32 >> 30) & 1; ctx.xer.ca = ({}.u32 >> 29) & 1;", r(rd), r(rd), r(rd));
++            }
++            else if (spr == 8)
++                println("\tctx.lr = {}.u32;", r(rd));
++            else if (spr == 9)
++                println("\tctx.ctr.u64 = {}.u32;", r(rd));
++            else if (spr == 923)
++            {
++                // DMA_L: writing it with the trigger bit starts a locked-cache DMA
++                // (with DMA_U, SPR 922). The copy is done at once.
++                println("\tctx.spr[923] = {}.u32;", r(rd));
++                println("\tif (ctx.spr[923] & 2) {{ PPC_LC_DMA(ctx.spr[922], ctx.spr[923]); ctx.spr[923] &= ~2u; }}");
++            }
++            else
++                println("\tctx.spr[{}] = {}.u32;", spr, r(rd));
++            return true;
++        case 339: // mfspr
++            if (spr == 1)
++                println("\t{}.u64 = (uint32_t(ctx.xer.so) << 31) | (uint32_t(ctx.xer.ov) << 30) | (uint32_t(ctx.xer.ca) << 29);", r(rd));
++            else if (spr == 8)
++                println("\t{}.u64 = uint32_t(ctx.lr);", r(rd));
++            else if (spr == 9)
++                println("\t{}.u64 = ctx.ctr.u32;", r(rd));
++            else
++                println("\t{}.u64 = ctx.spr[{}];", r(rd), spr);
++            return true;
++        case 146: // mtmsr
++            println("\tctx.msr = {}.u32;", r(rd));
++            return true;
++        case 210: case 242: // mtsr, mtsrin: segment registers, unused on the Wii
++            return true;
++        case 595: case 659: // mfsr, mfsrin
++            println("\t{}.u64 = 0;", r(rd));
++            return true;
++        case 512: // mcrxr
++            println("\tctx.cr{}.lt = ctx.xer.so; ctx.cr{}.gt = ctx.xer.ov; ctx.cr{}.eq = ctx.xer.ca; ctx.cr{}.so = 0;",
++                rd >> 2, rd >> 2, rd >> 2, rd >> 2);
++            println("\tctx.xer.so = ctx.xer.ov = ctx.xer.ca = 0;");
++            return true;
++        case 144: // mtcrf
++        {
++            uint32_t fxm = (word >> 12) & 0xFF;
++            for (uint32_t i = 0; i < 8; i++)
++            {
++                if (fxm & (0x80 >> i))
++                {
++                    uint32_t sh = 31 - 4 * i;
++                    println("\tctx.cr{}.lt = ({}.u32 >> {}) & 1; ctx.cr{}.gt = ({}.u32 >> {}) & 1; ctx.cr{}.eq = ({}.u32 >> {}) & 1; ctx.cr{}.so = ({}.u32 >> {}) & 1;",
++                        i, r(rd), sh, i, r(rd), sh - 1, i, r(rd), sh - 2, i, r(rd), sh - 3);
++                }
++            }
++            return true;
++        }
++        case 4: // tw
++            println("\tif (PPC_TRAP_TEST_REG({}, {}.s32, {}.s32)) PPC_TRAP(0x{:X});", rd, r(ra), r(rb), address);
++            return true;
++        case 306: case 566: case 470: case 982: case 310: case 438: // tlbie tlbsync dcbi icbi eciwx ecowx
++            return true;
++        case 375: // lhaux
++            println("\t{{ uint32_t ea = {}; {}.s64 = int16_t(PPC_LOAD_U16(ea)); {}.u32 = ea; }}", eaIndexed(), r(rd), r(ra));
++            return true;
++        case 631: // lfdux
++            println("\t{{ uint32_t ea = {}; {}.u64 = PPC_LOAD_U64(ea); ctx.ps1[{}] = {}.f64; {}.u32 = ea; }}", eaIndexed(), f(rd), rd, f(rd), r(ra));
++            return true;
++        case 759: // stfdux
++            println("\t{{ uint32_t ea = {}; PPC_STORE_U64(ea, {}.u64); {}.u32 = ea; }}", eaIndexed(), f(rd), r(ra));
++            return true;
++        case 597: case 725: // lswi, stswi
++        {
++            uint32_t nb = rb == 0 ? 32 : rb;
++            bool load = xo == 597;
++            println("\t{{");
++            println("\t\tuint32_t ea = {};", ra == 0 ? std::string("0u") : r(ra) + ".u32");
++            for (uint32_t i = 0; i < nb; i++)
++            {
++                uint32_t reg = (rd + i / 4) % 32;
++                uint32_t shift = 24 - 8 * (i % 4);
++                if (load)
++                {
++                    if (i % 4 == 0)
++                        println("\t\t{}.u64 = 0;", r(reg));
++                    println("\t\t{}.u32 |= uint32_t(PPC_LOAD_U8(ea + {}u)) << {};", r(reg), i, shift);
++                }
++                else
++                    println("\t\tPPC_STORE_U8(ea + {}u, uint8_t({}.u32 >> {}));", i, r(reg), shift);
++            }
++            println("\t}}");
++            return true;
++        }
++        default:
++            break;
++        }
++
++        uint32_t xo9 = (word >> 1) & 511;
++        if (xo9 == 232) // subfme
++        {
++            println("\t{{ uint64_t t = uint64_t(~{}.u32) + ctx.xer.ca + 0xFFFFFFFFull; ctx.xer.ca = t >> 32; {}.u64 = uint32_t(t); }}", r(ra), r(rd));
++            if (word & 1)
++                println("\tctx.cr0.compare<int32_t>({}.s32, 0, ctx.xer);", r(rd));
++            return true;
++        }
++        if (xo9 == 8) // subfc with OE (subfco)
++        {
++            println("\tctx.xer.ca = {}.u32 >= {}.u32;", r(rb), r(ra));
++            println("\t{}.s64 = {}.s64 - {}.s64;", r(rd), r(rb), r(ra));
++            if (word & 1)
++                println("\tctx.cr0.compare<int32_t>({}.s32, 0, ctx.xer);", r(rd));
++            return true;
++        }
++    }
++
++    return false;
++}
++
++bool Recompiler::FillsPairedSingle(int id)
++{
++    // With paired singles enabled (HID2[PSE]), single-precision results and lfs also write ps1.
++    switch (id)
++    {
++    case PPC_INST_LFS:
++    case PPC_INST_LFSU:
++    case PPC_INST_LFSX:
++    case PPC_INST_LFSUX:
++    case PPC_INST_FADDS:
++    case PPC_INST_FSUBS:
++    case PPC_INST_FMULS:
++    case PPC_INST_FDIVS:
++    case PPC_INST_FMADDS:
++    case PPC_INST_FMSUBS:
++    case PPC_INST_FNMADDS:
++    case PPC_INST_FNMSUBS:
++    case PPC_INST_FRES:
++    case PPC_INST_FRSP:
++        return true;
++    default:
++        return false;
++    }
++}
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index fa91527..ac24caa 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -174,7 +174,10 @@ void Recompiler::Analyse()
+         image.symbols.emplace(fmt::format("sub_{:X}", address), address, size, Symbol_Function);
+     }
+ 
+-    auto& pdata = *image.Find(".pdata");
++    // Wii ELF images have no .pdata: their functions come from the config's `functions` list.
++    static const Section emptyPdata{};
++    const Section* pdataSection = image.Find(".pdata");
++    auto& pdata = pdataSection != nullptr ? *pdataSection : emptyPdata;
+     size_t count = pdata.size / sizeof(IMAGE_CE_RUNTIME_FUNCTION);
+     auto* pf = (IMAGE_CE_RUNTIME_FUNCTION*)pdata.data;
+     for (size_t i = 0; i < count; i++)
+@@ -195,6 +198,9 @@ void Recompiler::Analyse()
+ 
+     for (const auto& section : image.sections)
+     {
++        if (config.declaredFunctionsOnly)
++            break;
++
+         if (!(section.flags & SectionFlags_Code))
+         {
+             continue;
+@@ -609,7 +615,11 @@ bool Recompiler::Recompile(
+     case PPC_INST_BCTR:
+         if (switchTable != config.switchTables.end())
+         {
+-            println("\tswitch ({}.u64) {{", r(switchTable->second.r));
++            // GH:WoR: el indice de la tabla son los 32 bits bajos (rlwinm con mascara envolvente deja basura en los altos)
++            if (switchTable->second.shift != 0)
++                println("\tswitch ({}.u32 >> {}) {{", r(switchTable->second.r), switchTable->second.shift);
++            else
++                println("\tswitch ({}.u32) {{", r(switchTable->second.r));
+ 
+             for (size_t i = 0; i < switchTable->second.labels.size(); i++)
+             {
+@@ -628,7 +638,18 @@ bool Recompiler::Recompile(
+             }
+ 
+             println("\tdefault:");
+-            println("\t\t__builtin_unreachable();");
++            {
++                // Wii: an out-of-range value must not be undefined behaviour (it made the
++                // host compiler jump anywhere). Go to the table's default, or report it.
++                uint32_t def = switchTable->second.defaultLabel;
++                if (def >= fn.base && def < fn.base + fn.size)
++                    println("\t\tgoto loc_{:X};", def);
++                else
++                {
++                    println("\t\tPPC_TRAP(0x{:X});", base);
++                    println("\t\treturn;");
++                }
++            }
+             println("\t}}");
+ 
+             switchTable = config.switchTables.end();
+@@ -668,6 +689,220 @@ bool Recompiler::Recompile(
+         println("\tif ({}.u32 != 0 && !{}.eq) goto loc_{:X};", ctr(), cr(insn.operands[0] / 4), insn.operands[1]);
+         break;
+ 
++// ---- GH:WoR instrucciones anadidas ----
++    case PPC_INST_LHZU:
++        println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.u64 = PPC_LOAD_U16({});", r(insn.operands[0]), ea());
++        println("\t{}.u32 = {};", r(insn.operands[2]), ea());
++        break;
++
++    case PPC_INST_LHZUX:
++        println("\t{} = {}.u32 + {}.u32;", ea(), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.u64 = PPC_LOAD_U16({});", r(insn.operands[0]), ea());
++        println("\t{}.u32 = {};", r(insn.operands[1]), ea());
++        break;
++
++    case PPC_INST_LHAU:
++        println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.s64 = (int16_t)PPC_LOAD_U16({});", r(insn.operands[0]), ea());
++        println("\t{}.u32 = {};", r(insn.operands[2]), ea());
++        break;
++
++    case PPC_INST_LBZUX:
++        println("\t{} = {}.u32 + {}.u32;", ea(), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.u64 = PPC_LOAD_U8({});", r(insn.operands[0]), ea());
++        println("\t{}.u32 = {};", r(insn.operands[1]), ea());
++        break;
++
++    case PPC_INST_LWZUX:
++        println("\t{} = {}.u32 + {}.u32;", ea(), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.u64 = PPC_LOAD_U32({});", r(insn.operands[0]), ea());
++        println("\t{}.u32 = {};", r(insn.operands[1]), ea());
++        break;
++
++    case PPC_INST_STHU:
++        println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(insn.operands[2]));
++        println("\tPPC_STORE_U16({}, {}.u16);", ea(), r(insn.operands[0]));
++        println("\t{}.u32 = {};", r(insn.operands[2]), ea());
++        break;
++
++    case PPC_INST_STHUX:
++        println("\t{} = {}.u32 + {}.u32;", ea(), r(insn.operands[1]), r(insn.operands[2]));
++        println("\tPPC_STORE_U16({}, {}.u16);", ea(), r(insn.operands[0]));
++        println("\t{}.u32 = {};", r(insn.operands[1]), ea());
++        break;
++
++    case PPC_INST_STBUX:
++        println("\t{} = {}.u32 + {}.u32;", ea(), r(insn.operands[1]), r(insn.operands[2]));
++        println("\tPPC_STORE_U8({}, {}.u8);", ea(), r(insn.operands[0]));
++        println("\t{}.u32 = {};", r(insn.operands[1]), ea());
++        break;
++
++    case PPC_INST_STDUX:
++        println("\t{} = {}.u32 + {}.u32;", ea(), r(insn.operands[1]), r(insn.operands[2]));
++        println("\tPPC_STORE_U64({}, {}.u64);", ea(), r(insn.operands[0]));
++        println("\t{}.u32 = {};", r(insn.operands[1]), ea());
++        break;
++
++    case PPC_INST_LFSU:
++    case PPC_INST_LFSUX:
++        printSetFlushMode(false);
++        if (id == PPC_INST_LFSU)
++            println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(insn.operands[2]));
++        else
++            println("\t{} = {}.u32 + {}.u32;", ea(), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.u32 = PPC_LOAD_U32({});", temp(), ea());
++        println("\t{}.f64 = double({}.f32);", f(insn.operands[0]), temp());
++        println("\t{}.u32 = {};", r(insn.operands[id == PPC_INST_LFSU ? 2 : 1]), ea());
++        break;
++
++    case PPC_INST_STFSU:
++    case PPC_INST_STFSUX:
++        printSetFlushMode(false);
++        if (id == PPC_INST_STFSU)
++            println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(insn.operands[2]));
++        else
++            println("\t{} = {}.u32 + {}.u32;", ea(), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.f32 = float({}.f64);", temp(), f(insn.operands[0]));
++        println("\tPPC_STORE_U32({}, {}.u32);", ea(), temp());
++        println("\t{}.u32 = {};", r(insn.operands[id == PPC_INST_STFSU ? 2 : 1]), ea());
++        break;
++
++    case PPC_INST_LFDU:
++        printSetFlushMode(false);
++        println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.u64 = PPC_LOAD_U64({});", f(insn.operands[0]), ea());
++        println("\t{}.u32 = {};", r(insn.operands[2]), ea());
++        break;
++
++    case PPC_INST_STFDU:
++        printSetFlushMode(false);
++        println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(insn.operands[2]));
++        println("\tPPC_STORE_U64({}, {}.u64);", ea(), f(insn.operands[0]));
++        println("\t{}.u32 = {};", r(insn.operands[2]), ea());
++        break;
++
++    case PPC_INST_LHBRX:
++        print("\t{}.u64 = __builtin_bswap16(PPC_LOAD_U16(", r(insn.operands[0]));
++        if (insn.operands[1] != 0)
++            print("{}.u32 + ", r(insn.operands[1]));
++        println("{}.u32));", r(insn.operands[2]));
++        break;
++
++    case PPC_INST_DCBST:
++        // no op (cache)
++        break;
++
++    case PPC_INST_BDZF:
++    case PPC_INST_BDNZT:
++    {
++        static const char* crBits[] = { "lt", "gt", "eq", "so" };
++        println("\t--{}.u64;", ctr());
++        if (id == PPC_INST_BDZF)
++            print("\tif ({}.u32 == 0 && !{}.{}) ", ctr(), cr(insn.operands[0] / 4), crBits[insn.operands[0] % 4]);
++        else
++            print("\tif ({}.u32 != 0 && {}.{}) ", ctr(), cr(insn.operands[0] / 4), crBits[insn.operands[0] % 4]);
++        if (insn.operands[1] < fn.base || insn.operands[1] >= fn.base + fn.size)
++        {
++            // destino fuera de la funcion: llamada + return (como printConditionalBranch)
++            println("{{");
++            print("\t");
++            printFunctionCall(insn.operands[1]);
++            println("\t\treturn;");
++            println("\t}}");
++        }
++        else
++            println("goto loc_{:X};", insn.operands[1]);
++        break;
++    }
++
++    case PPC_INST_EQV:
++        println("\t{}.u64 = ~({}.u64 ^ {}.u64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_SUBFZE:
++        println("\t{}.s64 = ~{}.s64 + {}.ca;", temp(), r(insn.operands[1]), xer());
++        println("\t{}.ca = {}.u32 < ~{}.u32 || ({}.ca && ~{}.u32 == 0xFFFFFFFF);", xer(), temp(), r(insn.operands[1]), xer(), r(insn.operands[1]));
++        println("\t{}.s64 = {}.s64;", r(insn.operands[0]), temp());
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_ADDME:
++        println("\t{}.s64 = {}.s64 + {}.ca - 1;", temp(), r(insn.operands[1]), xer());
++        println("\t{}.ca = ({}.u32 != 0) || {}.ca;", xer(), r(insn.operands[1]), xer());
++        println("\t{}.s64 = {}.s64;", r(insn.operands[0]), temp());
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_ADDC:
++        println("\t{}.ca = {}.u32 + {}.u32 < {}.u32;", xer(), r(insn.operands[1]), r(insn.operands[2]), r(insn.operands[1]));
++        println("\t{}.u64 = {}.u64 + {}.u64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_MULHDU:
++        println("\t{}.u64 = uint64_t((unsigned __int128)({}.u64) * (unsigned __int128)({}.u64) >> 64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int64_t>({}.s64, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_FRSQRTE:
++        printSetFlushMode(false);
++        println("\t{}.f64 = 1.0 / sqrt({}.f64);", f(insn.operands[0]), f(insn.operands[1]));
++        break;
++
++    case PPC_INST_FNMADD:
++        printSetFlushMode(false);
++        println("\t{}.f64 = -({}.f64 * {}.f64 + {}.f64);", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        break;
++
++    case PPC_INST_VANDC:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_andnot_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
++        break;
++
++    case PPC_INST_VSEL128:
++        // vsel128 vD, vA, vB: vD = (vA & ~vD) | (vB & vD)
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_or_si128(simde_mm_andnot_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)), simde_mm_and_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8))));", v(insn.operands[0]), v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[0]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VPKSWSS:
++    case PPC_INST_VPKSWSS128:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.s16, simde_mm_packs_epi32(simde_mm_load_si128((simde__m128i*){}.s32), simde_mm_load_si128((simde__m128i*){}.s32)));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
++        break;
++
++    case PPC_INST_VSUBSHS:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.s16, simde_mm_subs_epi16(simde_mm_load_si128((simde__m128i*){}.s16), simde_mm_load_si128((simde__m128i*){}.s16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VSUBUWM:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u32, simde_mm_sub_epi32(simde_mm_load_si128((simde__m128i*){}.u32), simde_mm_load_si128((simde__m128i*){}.u32)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VADDSWS:
++        for (size_t i = 0; i < 4; i++)
++        {
++            println("\t{}.s64 = int64_t({}.s32[{}]) + int64_t({}.s32[{}]);", temp(), v(insn.operands[1]), i, v(insn.operands[2]), i);
++            println("\t{}.s32[{}] = {}.s64 > INT32_MAX ? INT32_MAX : ({}.s64 < INT32_MIN ? INT32_MIN : int32_t({}.s64));", v(insn.operands[0]), i, temp(), temp(), temp());
++        }
++        break;
++
++    case PPC_INST_VCFPUXWS128:
++    {
++        printSetFlushMode(true);
++        double scale = double(1u << insn.operands[2]);
++        for (size_t i = 0; i < 4; i++)
++        {
++            println("\t{}.f64 = double({}.f32[{}]) * {};", temp(), v(insn.operands[1]), i, scale);
++            println("\t{}.u32[{}] = ({}.f64 != {}.f64 || {}.f64 <= 0.0) ? 0u : ({}.f64 >= 4294967295.0 ? 0xFFFFFFFFu : uint32_t({}.f64));", v(insn.operands[0]), i, temp(), temp(), temp(), temp(), temp());
++        }
++        break;
++    }
++
+     case PPC_INST_BEQ:
+         printConditionalBranch(false, "eq");
+         break;
+@@ -712,7 +947,12 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_BLRL:
+-        println("__builtin_debugtrap();");
++        // GH:WoR: llamada a la direccion en LR (y LR = siguiente instruccion)
++        println("\t{}.u64 = ctx.lr;", temp());
++        if (!config.skipLr)
++            println("\tctx.lr = 0x{:X};", base + 4);
++        println("\tPPC_CALL_INDIRECT_FUNC({}.u32);", temp());
++        csrState = CSRState::Unknown;
+         break;
+ 
+     case PPC_INST_BLT:
+@@ -827,23 +1067,23 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_DIVD:
+-        println("\t{}.s64 = {}.s64 / {}.s64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.s64 = ppc_divd({}.s64, {}.s64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
+         break;
+ 
+     case PPC_INST_DIVDU:
+-        println("\t{}.u64 = {}.u64 / {}.u64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.u64 = ppc_divdu({}.u64, {}.u64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
+         if (strchr(insn.opcode->name, '.'))
+             println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
+         break;
+ 
+     case PPC_INST_DIVW:
+-        println("\t{}.s32 = {}.s32 / {}.s32;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.s32 = ppc_divw({}.s32, {}.s32);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
+         if (strchr(insn.opcode->name, '.'))
+             println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
+         break;
+ 
+     case PPC_INST_DIVWU:
+-        println("\t{}.u32 = {}.u32 / {}.u32;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.u32 = ppc_divwu({}.u32, {}.u32);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
+         if (strchr(insn.opcode->name, '.'))
+             println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
+         break;
+@@ -1043,6 +1283,10 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_LDARX:
++        print("\tppc_reserve(");
++        if (insn.operands[1] != 0)
++            print("{}.u32 + ", r(insn.operands[1]));
++        println("{}.u32);", r(insn.operands[2]));
+         print("\t{}.u64 = *(uint64_t*)(base + ", reserved());
+         if (insn.operands[1] != 0)
+             print("{}.u32 + ", r(insn.operands[1]));
+@@ -1133,6 +1377,7 @@ bool Recompiler::Recompile(
+         println("\t{}.s64 = {};", r(insn.operands[0]), int32_t(insn.operands[1] << 16));
+         break;
+ 
++    case PPC_INST_LVEHX:
+     case PPC_INST_LVEWX:
+     case PPC_INST_LVEWX128:
+     case PPC_INST_LVX:
+@@ -1187,6 +1432,10 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_LWARX:
++        print("\tppc_reserve(");
++        if (insn.operands[1] != 0)
++            print("{}.u32 + ", r(insn.operands[1]));
++        println("{}.u32);", r(insn.operands[2]));
+         print("\t{}.u32 = *(uint32_t*)(base + ", reserved());
+         if (insn.operands[1] != 0)
+             print("{}.u32 + ", r(insn.operands[1]));
+@@ -1260,7 +1509,13 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_MFTB:
+-        println("\t{}.u64 = __rdtsc();", r(insn.operands[0]));
++        // GH:WoR: el time base de Xenon va a 50 MHz (KeQueryPerformanceFrequency); __rdtsc va a GHz y rompe los timeouts
++        // Wii: 32-bit CPU. "mftb rD,269" (TBU) reads the upper half and plain mftb (TBL,
++        // 268) the lower half; OSGetTime reads TBU, TBL, TBU and retries on a carry.
++        if (insn.operands[1] == 269)
++            println("\t{}.u64 = ppc_mftb() >> 32;", r(insn.operands[0]));
++        else
++            println("\t{}.u64 = uint32_t(ppc_mftb());", r(insn.operands[0]));
+         break;
+ 
+     case PPC_INST_MR:
+@@ -1503,10 +1758,10 @@ bool Recompiler::Recompile(
+     case PPC_INST_STDCX:
+         println("\t{}.lt = 0;", cr(0));
+         println("\t{}.gt = 0;", cr(0));
+-        print("\t{}.eq = __sync_bool_compare_and_swap(reinterpret_cast<uint64_t*>(base + ", cr(0));
++        print("\t{}.eq = ppc_stdcx64(base, ", cr(0));
+         if (insn.operands[1] != 0)
+             print("{}.u32 + ", r(insn.operands[1]));
+-        println("{}.u32), {}.s64, __builtin_bswap64({}.s64));", r(insn.operands[2]), reserved(), r(insn.operands[0]));
++        println("{}.u32, {}.u64, __builtin_bswap64({}.u64));", r(insn.operands[2]), reserved(), r(insn.operands[0]));
+         println("\t{}.so = {}.so;", cr(0), xer());
+         break;
+ 
+@@ -1658,10 +1913,10 @@ bool Recompiler::Recompile(
+     case PPC_INST_STWCX:
+         println("\t{}.lt = 0;", cr(0));
+         println("\t{}.gt = 0;", cr(0));
+-        print("\t{}.eq = __sync_bool_compare_and_swap(reinterpret_cast<uint32_t*>(base + ", cr(0));
++        print("\t{}.eq = ppc_stwcx32(base, ", cr(0));
+         if (insn.operands[1] != 0)
+             print("{}.u32 + ", r(insn.operands[1]));
+-        println("{}.u32), {}.s32, __builtin_bswap32({}.s32));", r(insn.operands[2]), reserved(), r(insn.operands[0]));
++        println("{}.u32, {}.u32, __builtin_bswap32({}.u32));", r(insn.operands[2]), reserved(), r(insn.operands[0]));
+         println("\t{}.so = {}.so;", cr(0), xer());
+         break;
+ 
+@@ -1831,7 +2086,16 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_VCMPBFP:
+     case PPC_INST_VCMPBFP128:
+-        println("\t__builtin_debugtrap();");
++        // GH:WoR: comparacion de limites. bit31 = !(a <= b), bit30 = !(a >= -b)
++        printSetFlushMode(true);
++        for (size_t i = 0; i < 4; i++)
++            println("\t{0}.u32[{1}] = ({2}.f32[{1}] <= {3}.f32[{1}] ? 0u : 0x80000000u) | ({2}.f32[{1}] >= -{3}.f32[{1}] ? 0u : 0x40000000u);", vTemp(), i, v(insn.operands[1]), v(insn.operands[2]));
++        println("\t{} = {};", v(insn.operands[0]), vTemp());
++        if (strchr(insn.opcode->name, '.'))
++        {
++            println("\t{}.lt = 0; {}.gt = 0; {}.so = 0;", cr(6), cr(6), cr(6));
++            println("\t{}.eq = ({}.u32[0] | {}.u32[1] | {}.u32[2] | {}.u32[3]) == 0;", cr(6), v(insn.operands[0]), v(insn.operands[0]), v(insn.operands[0]), v(insn.operands[0]));
++        }
+         break;
+ 
+     case PPC_INST_VCMPEQFP:
+@@ -2014,6 +2278,28 @@ bool Recompiler::Recompile(
+             println("\t{}.u32[{}] = {}.u32;", v(insn.operands[0]), insn.operands[4], temp());
+             break;
+ 
++        // ---- GH:WoR: tipos anadidos. Resultado de 32 bits en la palabra host u32[shift] (pack = 1), como el caso 0 ----
++        case 2: // NORMPACKED32 2_10_10_10: XYZ con signo saturado a +-511 sobre 3.0, W sin signo 0..3 sobre 1.0
++            if (insn.operands[3] != 1)
++                fmt::println("Unexpected NORMPACKED32 pack instruction at {:X}", base);
++            println("\t{}.u32 = 0;", temp());
++            for (size_t i = 0; i < 3; i++)
++            {
++                println("\t{}.s32[0] = {}.s32[{}] < 0x403FFE01 ? 0x403FFE01 : ({}.s32[{}] > 0x404001FF ? 0x404001FF : {}.s32[{}]);", vTemp(), v(insn.operands[1]), 3 - i, v(insn.operands[1]), 3 - i, v(insn.operands[1]), 3 - i);
++                println("\t{}.u32 |= (uint32_t({}.s32[0] - 0x40400000) & 0x3FF) << {};", temp(), vTemp(), 10 * i);
++            }
++            println("\t{}.s32[0] = {}.s32[0] < 0x3F800000 ? 0x3F800000 : ({}.s32[0] > 0x3F800003 ? 0x3F800003 : {}.s32[0]);", vTemp(), v(insn.operands[1]), v(insn.operands[1]), v(insn.operands[1]));
++            println("\t{}.u32 |= uint32_t({}.s32[0] - 0x3F800000) << 30;", temp(), vTemp());
++            println("\t{}.u32[{}] = {}.u32;", v(insn.operands[0]), insn.operands[4], temp());
++            break;
++
++        case 3: // FLOAT16_2: x -> mitad alta, y -> mitad baja
++            if (insn.operands[3] != 1)
++                fmt::println("Unexpected float16_2 pack instruction at {:X}", base);
++            println("\t{}.u16[{}] = ppc_float_to_xenos_half({}.f32[2]);", v(insn.operands[0]), 2 * insn.operands[4], v(insn.operands[1]));
++            println("\t{}.u16[{}] = ppc_float_to_xenos_half({}.f32[3]);", v(insn.operands[0]), 2 * insn.operands[4] + 1, v(insn.operands[1]));
++            break;
++
+         case 5: // float16_4
+             if (insn.operands[3] != 2 || insn.operands[4] > 2)
+                 fmt::println("Unexpected float16_4 pack instruction at {:X}", base);
+@@ -2212,7 +2498,35 @@ bool Recompiler::Recompile(
+             println("\t{} = {};", v(insn.operands[0]), vTemp());
+             break;
+ 
++        // ---- GH:WoR: tipos anadidos (semantica de Xenia, con el vector invertido de XenonRecomp) ----
++        case 2: // NORMPACKED32 2_10_10_10 (w_z_y_x): XYZ con signo y saturados, W sin signo
++            println("\t{}.u32 = {}.u32[0];", temp(), v(insn.operands[1]));
++            for (size_t i = 0; i < 3; i++)
++            {
++                println("\t{}.s32[{}] = int32_t({}.u32 << {}) >> 22;", vTemp(), 3 - i, temp(), 22 - 10 * i);
++                println("\tif ({0}.s32[{1}] == -512) {0}.s32[{1}] = -511;", vTemp(), 3 - i);
++                println("\t{0}.u32[{1}] = 0x40400000u + uint32_t({0}.s32[{1}]);", vTemp(), 3 - i);
++            }
++            println("\t{}.u32[0] = 0x3F800000u + (({}.u32 >> 30) & 3);", vTemp(), temp());
++            println("\t{} = {};", v(insn.operands[0]), vTemp());
++            break;
++
++        case 3: // FLOAT16_2: (x, y, 0, 1)
++            println("\t{}.f32[3] = ppc_xenos_half_to_float({}.u16[1]);", vTemp(), v(insn.operands[1]));
++            println("\t{}.f32[2] = ppc_xenos_half_to_float({}.u16[0]);", vTemp(), v(insn.operands[1]));
++            println("\t{}.f32[1] = 0.0f;", vTemp());
++            println("\t{}.f32[0] = 1.0f;", vTemp());
++            println("\t{} = {};", v(insn.operands[0]), vTemp());
++            break;
++
++        case 5: // FLOAT16_4: (x, y, z, w)
++            for (size_t i = 0; i < 4; i++)
++                println("\t{}.f32[{}] = ppc_xenos_half_to_float({}.u16[{}]);", vTemp(), 3 - i, v(insn.operands[1]), 3 - i);
++            println("\t{} = {};", v(insn.operands[0]), vTemp());
++            break;
++
+         default:
++            fmt::println("WARNING: vupkd3d128 tipo {} sin implementar en {:X}", insn.operands[2] >> 2, base);
+             println("\t__builtin_debugtrap();");
+             break;
+         }
+@@ -2412,6 +2726,17 @@ bool Recompiler::Recompile(const Function& fn)
+         if (switchTable == config.switchTables.end())
+             switchTable = config.switchTables.find(base);
+ 
++        // Wii: paired singles and quantized loads/stores reuse opcodes that mean something
++        // else on the Xbox 360 (VMX, lq/stq), so they are decoded before the 360 disassembler.
++        if (IsGekkoInstruction(__builtin_bswap32(*data)))
++        {
++            if (!RecompileGekko(__builtin_bswap32(*data), base))
++                allRecompiled = false;
++            base += 4;
++            ++data;
++            continue;
++        }
++
+         ppc::Disassemble(data, 4, base, insn);
+ 
+         if (insn.opcode == nullptr)
+@@ -2429,8 +2754,23 @@ bool Recompiler::Recompile(const Function& fn)
+ 
+             if (!Recompile(fn, base, insn, data, switchTable, localVariables, csrState))
+             {
+-                fmt::println("Unrecognized instruction at 0x{:X}: {}", base, insn.opcode->name);
+-                allRecompiled = false;
++                // Wii: instructions the Xbox 360 recompiler never needed (CodeWarrior output,
++                // special registers and SDK supervisor code), decoded from the raw word.
++                if (!RecompileWiiExtra(__builtin_bswap32(*data), base))
++                {
++                    fmt::println("Unrecognized instruction at 0x{:X}: {}", base, insn.opcode->name);
++                    allRecompiled = false;
++                }
++            }
++            else if (FillsPairedSingle(insn.opcode->id))
++            {
++                // Wii: single-precision results also land in ps1.
++                println("\tctx.ps1[{}] = ctx.f{}.f64;", insn.operands[0], insn.operands[0]);
++            }
++            else if (insn.opcode->id == PPC_INST_RLWIMI && (__builtin_bswap32(*data) & 1))
++            {
++                // rlwimi. : XenonRecomp emits no cr0 update for it.
++                println("\tctx.cr0.compare<int32_t>(ctx.r{}.s32, 0, ctx.xer);", insn.operands[0]);
+             }
+         }
+ 
+diff --git a/XenonRecomp/recompiler.h b/XenonRecomp/recompiler.h
+index 8242db5..46d82bf 100644
+--- a/XenonRecomp/recompiler.h
++++ b/XenonRecomp/recompiler.h
+@@ -64,6 +64,12 @@ struct Recompiler
+ 
+     bool Recompile(const Function& fn);
+ 
++    // Gekko/Broadway (Wii) support, see gekko.cpp.
++    static bool IsGekkoInstruction(uint32_t word);
++    bool RecompileGekko(uint32_t word, uint32_t address);
++    bool RecompileWiiExtra(uint32_t word, uint32_t address);
++    static bool FillsPairedSingle(int id);
++
+     void Recompile(const std::filesystem::path& headerFilePath);
+ 
+     void SaveCurrentOutData(const std::string_view& name = std::string_view());
+diff --git a/XenonRecomp/recompiler_config.cpp b/XenonRecomp/recompiler_config.cpp
+index 81330a4..58e2be2 100644
+--- a/XenonRecomp/recompiler_config.cpp
++++ b/XenonRecomp/recompiler_config.cpp
+@@ -20,6 +20,7 @@ void RecompilerConfig::Load(const std::string_view& configFilePath)
+ 
+         skipLr = main["skip_lr"].value_or(false);
+         skipMsr = main["skip_msr"].value_or(false);
++        declaredFunctionsOnly = main["declared_functions_only"].value_or(false);
+         ctrAsLocalVariable = main["ctr_as_local"].value_or(false);
+         xerAsLocalVariable = main["xer_as_local"].value_or(false);
+         reservedRegisterAsLocalVariable = main["reserved_as_local"].value_or(false);
+@@ -83,6 +84,8 @@ void RecompilerConfig::Load(const std::string_view& configFilePath)
+                     auto& table = *entry.as_table();
+                     RecompilerSwitchTable switchTable;
+                     switchTable.r = *table["r"].value<uint32_t>();
++                    switchTable.shift = table["shift"].value_or(0u);
++                    switchTable.defaultLabel = table["default"].value_or(0u);
+                     for (auto& label : *table["labels"].as_array())
+                     {
+                         switchTable.labels.push_back(*label.value<uint32_t>());
+diff --git a/XenonRecomp/recompiler_config.h b/XenonRecomp/recompiler_config.h
+index 534e503..28e241a 100644
+--- a/XenonRecomp/recompiler_config.h
++++ b/XenonRecomp/recompiler_config.h
+@@ -4,6 +4,11 @@ struct RecompilerSwitchTable
+ {
+     uint32_t r;
+     std::vector<uint32_t> labels;
++    // Wii: CodeWarrior may scale the index in place (rlwinm r0,r0,2,0,29) before bctr,
++    // so the register holds index << shift.
++    uint32_t shift = 0;
++    // Target for values outside the table (0 = none).
++    uint32_t defaultLabel = 0;
+ };
+ 
+ struct RecompilerMidAsmHook
+@@ -36,6 +41,9 @@ struct RecompilerConfig
+     bool xerAsLocalVariable = false;
+     bool reservedRegisterAsLocalVariable = false;
+     bool skipMsr = false;
++    // Wii: recompile only the `functions` list (from dtk) and do not discover more,
++    // so data inside .text (e.g. MetroTRK's instruction table) is never treated as code.
++    bool declaredFunctionsOnly = false;
+     bool crRegistersAsLocalVariables = false;
+     bool nonArgumentRegistersAsLocalVariables = false;
+     bool nonVolatileRegistersAsLocalVariables = false;
+diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
+index 31a86cd..4898a39 100644
+--- a/XenonUtils/ppc_context.h
++++ b/XenonUtils/ppc_context.h
+@@ -11,6 +11,7 @@
+ #include <cstdint>
+ #include <cstdlib>
+ #include <cstring>
++#include <limits>
+ 
+ #include <x86/avx.h>
+ #include <x86/sse.h>
+@@ -542,8 +543,118 @@ struct alignas(0x40) PPCContext
+     PPCVRegister v126;
+     PPCVRegister v127;
+ #endif
++
++    // Wii (Gekko/Broadway): second half of each paired-single FPR (ps0 is fN.f64),
++    // and the special-purpose registers written with mtspr (GQR0-7 are spr[912..919]).
++    double ps1[32];
++    uint32_t spr[1024];
+ };
+ 
++// Traps (tw/twi) and system calls (sc). The runtime can define these before including
++// this header; by default they stop in the debugger.
++#ifndef PPC_TRAP
++#define PPC_TRAP(address) __builtin_debugtrap()
++#endif
++#ifndef PPC_SYSCALL
++#define PPC_SYSCALL(address) __builtin_debugtrap()
++#endif
++// TO field: 16 lt, 8 gt, 4 eq, 2 unsigned lt, 1 unsigned gt.
++#define PPC_TRAP_TEST(to, a, imm) ppc_trap_test((to), int32_t(a), int32_t(imm))
++#define PPC_TRAP_TEST_REG(to, a, b) ppc_trap_test((to), int32_t(a), int32_t(b))
++inline bool ppc_trap_test(uint32_t to, int32_t a, int32_t b)
++{
++    return ((to & 16) && a < b) || ((to & 8) && a > b) || ((to & 4) && a == b) ||
++        ((to & 2) && uint32_t(a) < uint32_t(b)) || ((to & 1) && uint32_t(a) > uint32_t(b));
++}
++
++// Wii quantized loads/stores. GQR layout: store type bits 0-2, store scale bits 8-13,
++// load type bits 16-18, load scale bits 24-29. Types: 0 float, 4 u8, 5 u16, 6 s8, 7 s16.
++// Scales are 6-bit signed powers of two: loads multiply by 2^-scale, stores by 2^scale.
++inline int32_t ppc_gqr_scale(uint32_t s)
++{
++    return (s & 0x20) ? int32_t(s) - 64 : int32_t(s);
++}
++
++inline uint32_t ppc_gqr_size(uint32_t type)
++{
++    return (type == 4 || type == 6) ? 1 : (type == 5 || type == 7) ? 2 : 4;
++}
++
++inline double ppc_psq_load(uint8_t* base, uint32_t ea, uint32_t gqr, uint32_t index)
++{
++    uint32_t type = (gqr >> 16) & 7;
++    int32_t scale = ppc_gqr_scale((gqr >> 24) & 0x3F);
++    uint32_t addr = ea + index * ppc_gqr_size(type);
++    switch (type)
++    {
++    case 4: return std::ldexp(double(PPC_LOAD_U8(addr)), -scale);
++    case 5: return std::ldexp(double(PPC_LOAD_U16(addr)), -scale);
++    case 6: return std::ldexp(double(int8_t(PPC_LOAD_U8(addr))), -scale);
++    case 7: return std::ldexp(double(int16_t(PPC_LOAD_U16(addr))), -scale);
++    default:
++    {
++        uint32_t bits = PPC_LOAD_U32(addr);
++        float value;
++        memcpy(&value, &bits, sizeof(value));
++        return double(value);
++    }
++    }
++}
++
++template<typename T>
++inline T ppc_psq_quantize(double value, int32_t scale)
++{
++    double v = std::ldexp(value, scale);
++    double lo = double(std::numeric_limits<T>::min());
++    double hi = double(std::numeric_limits<T>::max());
++    v = v < lo ? lo : (v > hi ? hi : v);
++    return T(v);
++}
++
++inline void ppc_psq_store(uint8_t* base, uint32_t ea, uint32_t gqr, uint32_t index, double value)
++{
++    uint32_t type = gqr & 7;
++    int32_t scale = ppc_gqr_scale((gqr >> 8) & 0x3F);
++    uint32_t addr = ea + index * ppc_gqr_size(type);
++    switch (type)
++    {
++    case 4: PPC_STORE_U8(addr, ppc_psq_quantize<uint8_t>(value, scale)); break;
++    case 5: PPC_STORE_U16(addr, ppc_psq_quantize<uint16_t>(value, scale)); break;
++    case 6: PPC_STORE_U8(addr, uint8_t(ppc_psq_quantize<int8_t>(value, scale))); break;
++    case 7: PPC_STORE_U16(addr, uint16_t(ppc_psq_quantize<int16_t>(value, scale))); break;
++    default:
++    {
++        float f = float(value);
++        uint32_t bits;
++        memcpy(&bits, &f, sizeof(bits));
++        PPC_STORE_U32(addr, bits);
++        break;
++    }
++    }
++}
++
++// Wii locked-cache DMA (Gekko DMA_U = SPR 922, DMA_L = SPR 923), done at once.
++// DMA_U: memory address (bits 31-5), length high bits (4-0).
++// DMA_L: locked-cache address (bits 31-5), bit 4 load (memory -> cache, else
++// cache -> memory), length low bits (3-2), bit 1 trigger. Length in 32-byte lines,
++// 0 meaning 128. Memory addresses may be physical: they map to the cached mirror.
++inline void ppc_lc_dma(uint8_t* base, uint32_t dmaU, uint32_t dmaL)
++{
++    uint32_t mem = dmaU & ~31u, cache = dmaL & ~31u;
++    if (mem < 0x80000000u)
++        mem |= 0x80000000u;
++    uint32_t lines = ((dmaU & 31) << 2) | ((dmaL >> 2) & 3);
++    uint32_t bytes = (lines ? lines : 128) * 32;
++    if ((dmaL >> 4) & 1)
++        memcpy(base + cache, base + mem, bytes);
++    else
++        memcpy(base + mem, base + cache, bytes);
++}
++#define PPC_LC_DMA(u, l) ppc_lc_dma(base, (u), (l))
++
++#define PPC_PSQ_LOAD(ea, gqr, index) ppc_psq_load(base, (ea), (gqr), (index))
++#define PPC_PSQ_STORE(ea, gqr, index, value) ppc_psq_store(base, (ea), (gqr), (index), (value))
++
+ inline uint8_t VectorMaskL[] =
+ {
+     0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00,

@@ -1,0 +1,8 @@
+Imagenes del launcher descargadas de SteamGridDB (https://www.steamgriddb.com/game/5249795), reducidas:
+- heroe_arte.jpg      hero 27813 de CluckenDip (arte oficial de EA ampliado)
+- heroe_aegis.jpg     hero 175556
+- heroe_ishimura.jpg  hero 175557
+- heroe_marcador.jpg  hero 175555
+- logo.png            logo 37592 de CluckenDip (logo oficial de EA)
+- portada_wii.jpg     grid 435321 (caja de Wii)
+Dead Space: Extraction es de Electronic Arts / Visceral Games.

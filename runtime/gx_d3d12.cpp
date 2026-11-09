@@ -539,9 +539,6 @@ float4 ps_copy(B i) : SV_Target
         efb.GetDimensions(w, h);
         uint z = uint(round(efb.Load(int3(min(uint2(i.uv * float2(w, h)), uint2(w - 1, h - 1)), 0)).r * 16777215.0));
         c = float4((z >> 16) & 0xFF, (z >> 8) & 0xFF, z & 0xFF, 255) / 255.0;
-        if (cparams.w >= 3)  // DSE_ZDUMP: R = u, G = depth at a fixed point, B = depth here
-            c = float4(i.uv.x, efb.Load(int3(w / 8, h / 16, 0)).r,
-                efb.Load(int3(min(uint2(i.uv * float2(w, h)), uint2(w - 1, h - 1)), 0)).r, 1);
     }
     else
         c = efb.Sample(sClampLinear, i.uv);
@@ -723,10 +720,6 @@ uint32_t g_frame = 0;
 uint32_t g_frameDrawCount = 0;
 uint32_t g_depthCopyFrame = 0;
 std::vector<std::string> g_tailDraws;  // DSE_COPYPROBE: draws since the last texture copy  // last frame with an EFB depth copy (debugging)
-char g_recentDraws[12][160];
-uint32_t g_recentDrawPos = 0;
-char g_susp[64][160];
-uint32_t g_suspPos = 0;  // draws since the last XFB copy (debugging)
 bool g_inFrame = false;
 bool g_efbIsTarget = true;   // EFB state: render target (true) or shader resource
 bool g_pendingClear = true;
@@ -1432,28 +1425,6 @@ void FillConstants(DrawConstants& c, uint32_t& textureMask)
             c.fogParams[1] = fogFloat(f3);
             c.fogParams[2] = float(g_gx.bp[0xEF] & 0xFFFFFF);
             c.fogParams[3] = float(g_gx.bp[0xF0] & 0x1F);
-            static const bool fogLog = getenv("DSE_FOGLOG") != nullptr;
-            if (fogLog)
-            {
-                static std::set<uint64_t> seen;
-                uint64_t key = uint64_t(g_gx.bp[0xEE] & 0xFFFFF) | uint64_t(f3 & 0xFFFFFF) << 20 |
-                    uint64_t(g_gx.bp[0xEF] & 0xFFFF) << 44;
-                if (seen.insert(key).second && seen.size() < 60)
-                    LOG("[fog] type %u proj %u A %g C %g B %u shift %u color %06X range %06X vp z %g far %g "
-                        "proj %g %g %g %g %g %g ortho %u",
-                        type, (f3 >> 20) & 1, c.fogParams[0], c.fogParams[1], g_gx.bp[0xEF] & 0xFFFFFF,
-                        g_gx.bp[0xF0] & 0x1F, g_gx.bp[0xF2] & 0xFFFFFF, g_gx.bp[0xE8] & 0xFFFFFF, GxXfFloat(0x101C),
-                        GxXfFloat(0x101F), GxXfFloat(0x1020), GxXfFloat(0x1021), GxXfFloat(0x1022), GxXfFloat(0x1023),
-                        GxXfFloat(0x1024), GxXfFloat(0x1025), g_gx.xfReg[0x26]);
-                if (fogLog && seen.size() < 60)
-                    LOG("[fog]   ztex F4 %06X F5 %06X stages %u order %06X %06X color %06X %06X alpha %06X %06X "
-                        "cmode0 %06X cmode1 %06X zmode %06X pe %06X tex0 %06X %06X",
-                        g_gx.bp[0xF4] & 0xFFFFFF, g_gx.bp[0xF5] & 0xFFFFFF, ((g_gx.bp[0] >> 10) & 15) + 1,
-                        g_gx.bp[0x28] & 0xFFFFFF, g_gx.bp[0x29] & 0xFFFFFF, g_gx.bp[0xC0] & 0xFFFFFF,
-                        g_gx.bp[0xC2] & 0xFFFFFF, g_gx.bp[0xC1] & 0xFFFFFF, g_gx.bp[0xC3] & 0xFFFFFF,
-                        g_gx.bp[0x41] & 0xFFFFFF, g_gx.bp[0x42] & 0xFFFFFF, g_gx.bp[0x40] & 0xFFFFFF,
-                        g_gx.bp[0x43] & 0xFFFFFF, g_gx.bp[0x88] & 0xFFFFFF, g_gx.bp[0x94] & 0xFFFFFF);
-            }
         }
     }
     // Indirect texturing is not done yet: count draws that use it (DSE_INDLOG=1).
@@ -2298,48 +2269,6 @@ float WideFactor(const GxVertex* v, uint32_t count)
         // Perspective: the world gets the wider view, except flat quads facing the camera that
         // already cover the whole 16:9 screen (tints, visor overlays placed just in front of
         // the camera): those must keep covering the whole screen.
-        static const bool wideLog3 = getenv("DSE_WIDELOG") != nullptr;
-        if (wideLog3)
-        {
-            float q0 = GxXfFloat(0x1020), q1 = GxXfFloat(0x1021);
-            float l = 1e9f, h = -1e9f, zl = 1e9f, zh = -1e9f;
-            for (uint32_t i = 0; i < count; i++)
-            {
-                uint32_t m = (v[i].idx[0] & 63) * 4;
-                float xv = GxXfFloat(m) * v[i].pos[0] + GxXfFloat(m + 1) * v[i].pos[1] + GxXfFloat(m + 2) * v[i].pos[2] + GxXfFloat(m + 3);
-                float zv = GxXfFloat(m + 8) * v[i].pos[0] + GxXfFloat(m + 9) * v[i].pos[1] + GxXfFloat(m + 10) * v[i].pos[2] + GxXfFloat(m + 11);
-                if (zv >= -1e-6f) { l = -1e9f; break; }
-                float cx = (q0 * xv + q1 * zv) / -zv;
-                l = std::min(l, cx); h = std::max(h, cx); zl = std::min(zl, zv); zh = std::max(zh, zv);
-            }
-            if (l < -1.3f && h > 1.3f)
-            {
-                static std::set<uint64_t> seen3;
-                uint64_t key = uint64_t(int(l * 20) & 0xFFFF) | uint64_t(int(h * 20) & 0xFFFF) << 16 | uint64_t(count) << 32;
-                if (seen3.insert(key).second && seen3.size() < 60)
-                    LOG("[wide] big persp x %.3f..%.3f z %.3f..%.3f count %u cmode0 %06X zmode %02X stages %u", l, h, zl, zh, count,
-                        g_gx.bp[0x41], g_gx.bp[0x40] & 0xFF, ((g_gx.bp[0] >> 10) & 15) + 1);
-            }
-        }
-        if (wideLog3)
-        {
-            uint32_t m = (v[0].idx[0] & 63) * 4;
-            float r00 = GxXfFloat(m), r01 = GxXfFloat(m + 1), r02 = GxXfFloat(m + 2);
-            float r10 = GxXfFloat(m + 4), r11 = GxXfFloat(m + 5), r12 = GxXfFloat(m + 6);
-            float r20 = GxXfFloat(m + 8), r21 = GxXfFloat(m + 9), r22 = GxXfFloat(m + 10);
-            bool noRot = std::fabs(r01) < 0.02f && std::fabs(r02) < 0.02f && std::fabs(r10) < 0.02f && std::fabs(r12) < 0.02f &&
-                std::fabs(r20) < 0.02f && std::fabs(r21) < 0.02f;
-            if (noRot)
-            {
-                static std::set<uint64_t> seen4;
-                uint64_t key = uint64_t(count) | uint64_t(g_gx.bp[0x41] & 0xFFFF) << 16 | uint64_t(g_gx.bp[0x40] & 0xFF) << 32 |
-                    uint64_t(int(r00 * 10) & 0xFF) << 40 | uint64_t((g_gx.bp[0x94] >> 4) & 0xFFFF) << 48;
-                if (seen4.insert(key).second && seen4.size() < 80)
-                    LOG("[wide] camera-space draw count %u scale %.3f %.3f %.3f t %.2f %.2f %.2f cmode0 %06X zmode %02X tex %06X stages %u",
-                        count, r00, r11, r22, GxXfFloat(m + 3), GxXfFloat(m + 7), GxXfFloat(m + 11), g_gx.bp[0x41],
-                        g_gx.bp[0x40] & 0xFF, g_gx.bp[0x94] & 0xFFFFFF, ((g_gx.bp[0] >> 10) & 15) + 1);
-            }
-        }
         // The game's interface (menus, HUD, crosshair, screen tints) is made of planes fixed in
         // front of the camera (no rotation in the position matrix, ~750 units away, or centered).
         {
@@ -2374,16 +2303,6 @@ float WideFactor(const GxVertex* v, uint32_t count)
             zhi = std::max(zhi, zv);
         }
         bool flat = (zhi - zlo) <= 0.001f * std::fabs(zlo);
-        static const bool wideLog2 = getenv("DSE_WIDELOG") != nullptr;
-        if (wideLog2 && hi - lo > 1.5f)
-        {
-            static std::set<uint64_t> seen2;
-            uint64_t key = uint64_t(int(lo * 50) & 0xFFFF) | uint64_t(int(hi * 50) & 0xFFFF) << 16 | uint64_t(count) << 32 |
-                uint64_t(g_gx.bp[0x41] & 0xFFF) << 40;
-            if (seen2.insert(key).second && seen2.size() < 100)
-                LOG("[wide] persp x %.3f..%.3f z %.3f..%.3f count %u flat %d cmode0 %06X zmode %02X", lo, hi, zlo, zhi, count,
-                    flat, g_gx.bp[0x41], g_gx.bp[0x40] & 0xFF);
-        }
         return (flat && lo <= -0.97f && hi >= 0.97f) ? 1.0f : g_wideK;
     }
     // 2D draws that read an EFB copy are post-effect steps (downsampling a copy into a corner
@@ -2416,29 +2335,6 @@ float WideFactor(const GxVertex* v, uint32_t count)
         float cx = p0 * xv + p1;
         lo = std::min(lo, cx);
         hi = std::max(hi, cx);
-    }
-    static const bool wideLog = getenv("DSE_WIDELOG") != nullptr;
-    if (wideLog)
-    {
-        static std::set<uint64_t> seen;
-        uint64_t key = uint64_t(int(lo * 100) & 0xFFFF) | uint64_t(int(hi * 100) & 0xFFFF) << 16 |
-            uint64_t(count) << 32 | uint64_t(g_gx.bp[0x41] & 0xFFF) << 44;
-        if (seen.insert(key).second && seen.size() < 400)
-        {
-            float cyLo = 1e9f, cyHi = -1e9f;
-            for (uint32_t i = 0; i < count; i++)
-            {
-                uint32_t m = (v[i].idx[0] & 63) * 4;
-                float yv = GxXfFloat(m + 4) * v[i].pos[0] + GxXfFloat(m + 5) * v[i].pos[1] + GxXfFloat(m + 6) * v[i].pos[2] +
-                    GxXfFloat(m + 7);
-                float cy = GxXfFloat(0x1022) * yv + GxXfFloat(0x1023);
-                cyLo = std::min(cyLo, cy);
-                cyHi = std::max(cyHi, cy);
-            }
-            LOG("[wide] ortho x %.3f..%.3f y %.3f..%.3f count %u cmode0 %06X vp %.0fx%.0f at %.0f,%.0f stages %u",
-                lo, hi, cyLo, cyHi, count, g_gx.bp[0x41], GxXfFloat(0x101A) * 2, -GxXfFloat(0x101B) * 2,
-                GxXfFloat(0x101D) - 342, GxXfFloat(0x101E) - 342, ((g_gx.bp[0] >> 10) & 15) + 1);
-        }
     }
     if (lo <= -0.97f && hi >= 0.97f)
     {
@@ -2569,182 +2465,6 @@ void GxBackendDraw(uint32_t primitive, const GxVertex* v, uint32_t count)
                 g_gx.bp[0x28] & 0xFFFFFF);
         }
     }
-    static const char* drawLogEnv = getenv("DSE_DRAWLOG");
-    if (const char* e = drawLogEnv)
-    {
-        static uint32_t lo = uint32_t(atoi(e)), hi = lo + 12;
-        if (g_frame % 150 == 0 && g_frameDrawCount >= lo && g_frameDrawCount <= hi && count > 0)
-        {
-            float mn[3] = { 1e9f, 1e9f, 1e9f }, mx[3] = { -1e9f, -1e9f, -1e9f };
-            for (uint32_t i = 0; i < count; i++)
-            {
-                uint32_t m = (v[i].idx[0] & 63) * 4;
-                for (int r = 0; r < 3; r++)
-                {
-                    float t = GxXfFloat(m + 4 * r) * v[i].pos[0] + GxXfFloat(m + 4 * r + 1) * v[i].pos[1] +
-                        GxXfFloat(m + 4 * r + 2) * v[i].pos[2] + GxXfFloat(m + 4 * r + 3);
-                    mn[r] = std::min(mn[r], t);
-                    mx[r] = std::max(mx[r], t);
-                }
-            }
-            LOG("[drawlog] #%u prim %u count %u zmode %02X cmode0 %04X genmode %06X ortho %u view x %.2f..%.2f y %.2f..%.2f z %.3f..%.3f "
-                "proj %g %g %g %g %g %g vp %g %g %g %g %g %g ztex %X fog %X stages %u",
-                g_frameDrawCount, primitive, count, g_gx.bp[0x40] & 0xFF, g_gx.bp[0x41] & 0xFFFF, g_gx.bp[0] & 0xFFFFFF,
-                g_gx.xfReg[0x26], mn[0], mx[0], mn[1], mx[1], mn[2], mx[2], GxXfFloat(0x1020), GxXfFloat(0x1021),
-                GxXfFloat(0x1022), GxXfFloat(0x1023), GxXfFloat(0x1024), GxXfFloat(0x1025), GxXfFloat(0x101A),
-                GxXfFloat(0x101B), GxXfFloat(0x101C), GxXfFloat(0x101D), GxXfFloat(0x101E), GxXfFloat(0x101F),
-                g_gx.bp[0xF5] & 0xF, (g_gx.bp[0xF1] >> 21) & 7, ((g_gx.bp[0] >> 10) & 15) + 1);
-            LOG("[drawlog]    v0 color %.3f %.3f %.3f %.3f tex %.3f %.3f | v2 color %.3f %.3f %.3f %.3f tex %.3f %.3f | vcd %08X %08X",
-                v[0].color[0], v[0].color[1], v[0].color[2], v[0].color[3], v[0].tex[0][0], v[0].tex[0][1],
-                v[count > 2 ? 2 : 0].color[0], v[count > 2 ? 2 : 0].color[1], v[count > 2 ? 2 : 0].color[2],
-                v[count > 2 ? 2 : 0].color[3], v[count > 2 ? 2 : 0].tex[0][0], v[count > 2 ? 2 : 0].tex[0][1],
-                g_gx.cp[0x50], g_gx.cp[0x60]);
-            {
-                uint32_t ta = ((g_gx.bp[0x94] & 0xFFFFFF) << 5) | 0x80000000;
-                char hex[400];
-                int n = 0;
-                for (int b = 0; b < 128 && n < 390; b += 2)
-                    n += snprintf(hex + n, sizeof(hex) - n, "%02X%02X%s", g_base[ta + b], g_base[ta + b + 1], (b % 8) == 6 ? " " : "");
-                LOG("[drawlog]    tex 0x%08X: %s", ta, hex);
-            }
-            LOG("[drawlog]    alphacmp %06X pe %06X order %06X color %06X alpha %06X ksel %06X %06X tex0 img %06X addr %06X mode %06X "
-                "tev regs %06X %06X konst %06X %06X chan ctrl %08X %08X mat %08X", g_gx.bp[0xF3] & 0xFFFFFF, g_gx.bp[0x43] & 0xFFFFFF,
-                g_gx.bp[0x28] & 0xFFFFFF, g_gx.bp[0xC0] & 0xFFFFFF, g_gx.bp[0xC1] & 0xFFFFFF, g_gx.bp[0xF6] & 0xFFFFFF,
-                g_gx.bp[0xF7] & 0xFFFFFF, g_gx.bp[0x88] & 0xFFFFFF, g_gx.bp[0x94] & 0xFFFFFF, g_gx.bp[0x80] & 0xFFFFFF,
-                g_gx.tevReg[0], g_gx.tevReg[1], g_gx.tevKonst[0], g_gx.tevKonst[1], g_gx.xfReg[0x0E], g_gx.xfReg[0x10],
-                g_gx.xfReg[0x0C]);
-        }
-    }
-    {
-        // DSE_ZPROBE=n1,n2,...: on frames that are multiples of 150, read the depth buffer back
-        // before those draw numbers and log a few of its values 10 frames later.
-        static std::vector<uint32_t> probes = [] {
-            std::vector<uint32_t> v;
-            if (const char* e = getenv("DSE_ZPROBE"))
-                for (const char* q = e; *q;)
-                {
-                    v.push_back(uint32_t(strtoul(q, (char**)&q, 10)));
-                    if (*q == ',') q++;
-                    else break;
-                }
-            return v;
-        }();
-        if (!probes.empty())
-        {
-        static std::vector<ComPtr<ID3D12Resource>> bufs(probes.size()), cbufs(probes.size());
-        static std::vector<uint32_t> probeFrame(probes.size(), 0);
-        static D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{}, cfp{};
-        for (size_t k = 0; k < probes.size(); k++)
-        {
-            if (probeFrame[k] && g_frame >= probeFrame[k] + 10)
-            {
-                void* data = nullptr;
-                D3D12_RANGE all{ 0, SIZE_T(fp.Footprint.RowPitch) * fp.Footprint.Height };
-                if (SUCCEEDED(bufs[k]->Map(0, &all, &data)))
-                {
-                    auto at = [&](float fx, float fy) {
-                        uint32_t x = uint32_t(fx * fp.Footprint.Width), y = uint32_t(fy * fp.Footprint.Height);
-                        uint32_t vv = *(const uint32_t*)((const uint8_t*)data + size_t(y) * fp.Footprint.RowPitch + x * 4);
-                        return (vv & 0xFFFFFF) / 16777215.0;
-                    };
-                    LOG("[zprobe] before draw %u (frame %u): %.5f %.5f %.5f | %.5f %.5f %.5f | %.5f %.5f %.5f", probes[k],
-                        probeFrame[k], at(0.1f, 0.05f), at(0.5f, 0.05f), at(0.9f, 0.05f), at(0.1f, 0.25f), at(0.5f, 0.25f),
-                        at(0.9f, 0.25f), at(0.1f, 0.6f), at(0.5f, 0.6f), at(0.9f, 0.6f));
-                    D3D12_RANGE none{ 0, 0 };
-                    bufs[k]->Unmap(0, &none);
-                }
-                // The EFB color as logs/probe_<draw>.bmp (half size).
-                if (SUCCEEDED(cbufs[k]->Map(0, nullptr, &data)))
-                {
-                    uint32_t w = cfp.Footprint.Width / 2, h = cfp.Footprint.Height / 2;
-                    std::vector<uint8_t> bgr(size_t(w) * h * 4);
-                    for (uint32_t y = 0; y < h; y++)
-                        for (uint32_t x = 0; x < w; x++)
-                        {
-                            const uint8_t* px = (const uint8_t*)data + size_t(y * 2) * cfp.Footprint.RowPitch + x * 8;
-                            uint8_t* o = &bgr[(size_t(y) * w + x) * 4];
-                            o[0] = px[2]; o[1] = px[1]; o[2] = px[0]; o[3] = 255;
-                        }
-                    BITMAPFILEHEADER fh{};
-                    BITMAPINFOHEADER ih{};
-                    ih.biSize = sizeof(ih); ih.biWidth = LONG(w); ih.biHeight = -LONG(h); ih.biPlanes = 1; ih.biBitCount = 32;
-                    fh.bfType = 0x4D42; fh.bfOffBits = sizeof(fh) + sizeof(ih); fh.bfSize = fh.bfOffBits + DWORD(bgr.size());
-                    char path[256];
-                    snprintf(path, sizeof(path), "G:/Dead Space Extraction PC/Recomp/logs/probe_%05u.bmp", probes[k]);
-                    if (FILE* f = fopen(path, "wb"))
-                    {
-                        fwrite(&fh, sizeof(fh), 1, f); fwrite(&ih, sizeof(ih), 1, f); fwrite(bgr.data(), 1, bgr.size(), f);
-                        fclose(f);
-                    }
-                    D3D12_RANGE none{ 0, 0 };
-                    cbufs[k]->Unmap(0, &none);
-                }
-                probeFrame[k] = 0;
-            }
-            if (g_frameDrawCount == probes[k] && g_frame % 150 == 0 && !probeFrame[k])
-            {
-                FlushDraws();
-                if (!bufs[k])
-                {
-                    D3D12_RESOURCE_DESC dd = g_depth->GetDesc();
-                    UINT64 total = 0;
-                    g_device->GetCopyableFootprints(&dd, 0, 1, 0, &fp, nullptr, nullptr, &total);
-                    bufs[k] = CreateBuffer(total, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-                }
-                Barrier(g_depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                D3D12_TEXTURE_COPY_LOCATION from{}, to{};
-                from.pResource = g_depth.Get();
-                from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                to.pResource = bufs[k].Get();
-                to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-                to.PlacedFootprint = fp;
-                g_list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
-                Barrier(g_depth.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-                if (!cbufs[k])
-                {
-                    D3D12_RESOURCE_DESC cd = g_efb->GetDesc();
-                    UINT64 total = 0;
-                    g_device->GetCopyableFootprints(&cd, 0, 1, 0, &cfp, nullptr, nullptr, &total);
-                    cbufs[k] = CreateBuffer(total, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-                }
-                Barrier(g_efb.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                from.pResource = g_efb.Get();
-                to.pResource = cbufs[k].Get();
-                to.PlacedFootprint = cfp;
-                g_list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
-                Barrier(g_efb.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-                probeFrame[k] = g_frame;
-            }
-        }
-        }
-    }
-    static const bool zDumpDraws = getenv("DSE_ZDUMP") != nullptr;
-    if (zDumpDraws && count > 0)
-    {
-        uint32_t m = (v[0].idx[0] & 63) * 4;
-        float vx = GxXfFloat(m) * v[0].pos[0] + GxXfFloat(m + 1) * v[0].pos[1] + GxXfFloat(m + 2) * v[0].pos[2] + GxXfFloat(m + 3);
-        float vz = GxXfFloat(m + 8) * v[0].pos[0] + GxXfFloat(m + 9) * v[0].pos[1] + GxXfFloat(m + 10) * v[0].pos[2] + GxXfFloat(m + 11);
-        bool ortho = g_gx.xfReg[0x26] != 0;
-        float cz = GxXfFloat(0x1024) * vz + GxXfFloat(0x1025), cw = ortho ? 1.0f : -vz;
-        float depth = (GxXfFloat(0x101F) + GxXfFloat(0x101C) * cz / cw) / 16777216.0f;
-        uint32_t zm = g_gx.bp[0x40];
-        bool suspicious = (zm & 0x10) && (ortho || ((g_gx.bp[0xF5] >> 2) & 3) || !(zm & 1) || ((zm >> 1) & 7) == 7);
-        if (suspicious && g_suspPos < 64)
-        {
-            snprintf(g_susp[g_suspPos++], 160, "#%u prim %u count %u zmode %02X cmode0 %04X ortho %u depth0 %.5f vz %.2f ztex %X stages %u",
-                g_frameDrawCount, primitive, count, zm & 0xFF, g_gx.bp[0x41] & 0xFFFF, ortho, depth, vz, g_gx.bp[0xF5] & 0xF,
-                ((g_gx.bp[0] >> 10) & 15) + 1);
-        }
-        if (!(zm & 0x10))
-            goto skipRecent;
-        {
-        char* line = g_recentDraws[g_recentDrawPos++ % 12];
-        snprintf(line, 160, "#%u prim %u count %u zmode %02X cmode0 %04X ortho %u depth0 %.5f vx %.2f vz %.2f vp %.0fx%.0f z %.0f far %.0f ztex %X",
-            g_frameDrawCount, primitive, count, g_gx.bp[0x40] & 0xFF, g_gx.bp[0x41] & 0xFFFF, ortho, depth, vx, vz,
-            GxXfFloat(0x101A) * 2, -GxXfFloat(0x101B) * 2, GxXfFloat(0x101C), GxXfFloat(0x101F), g_gx.bp[0xF5] & 0xF);
-        }
-    skipRecent:;
-    }
     uint32_t cull = (g_gx.bp[0x00] >> 14) & 3;
     if (cull == 3 && type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE)
         return;  // cull all: only points and lines are drawn
@@ -2788,76 +2508,6 @@ void GxBackendDraw(uint32_t primitive, const GxVertex* v, uint32_t count)
                 GxXfFloat(mm + 2), GxXfFloat(mm + 3), GxXfFloat(mm + 4), GxXfFloat(mm + 5), GxXfFloat(mm + 6), GxXfFloat(mm + 7),
                 GxXfFloat(mm + 8), GxXfFloat(mm + 9), GxXfFloat(mm + 10), GxXfFloat(mm + 11));
             g_tailDraws.push_back(std::string(line) + mtx);
-        }
-    }
-    // DSE_WIDESKIP=1 (debugging): don't draw 3D draws that get narrowed although they span past
-    // the 16:9 screen on both sides.
-    static const uint32_t texWatch = getenv("DSE_TEXWATCH") ? uint32_t(strtoul(getenv("DSE_TEXWATCH"), nullptr, 16)) : 0;
-    if (texWatch && g_frame % 300 == 0)
-    {
-        for (uint32_t mp = 0; mp < 8; mp++)
-        {
-            uint32_t a3 = g_gx.bp[(mp < 4 ? 0x94 : 0xB4) + (mp & 3)];
-            if ((((a3 & 0xFFFFFF) << 5) | 0x80000000) != texWatch)
-                continue;
-            uint32_t stages = ((g_gx.bp[0] >> 10) & 15) + 1;
-            bool used = false;
-            uint32_t coord = 0;
-            for (uint32_t st = 0; st < stages; st++)
-            {
-                uint32_t order = g_gx.bp[0x28 + st / 2] >> ((st & 1) * 12);
-                if (((order >> 6) & 1) && (order & 7) == mp) { used = true; coord = (order >> 3) & 7; }
-            }
-            if (!used)
-                continue;
-            static int logged = 0;
-            if (logged++ < 40)
-            {
-                uint32_t tg = g_gx.xfReg[0x40 + coord];
-                uint32_t mtxIdx = coord < 4 ? (g_gx.cp[0x30] >> (6 + coord * 6)) & 63 : (g_gx.cp[0x40] >> ((coord - 4) * 6)) & 63;
-                uint32_t m = mtxIdx * 4;
-                LOG("[texwatch] frame %u draw %u map %u coord %u texgen %08X post %08X mtx %u: %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f ortho %u count %u",
-                    g_frame, g_frameDrawCount, mp, coord, tg, g_gx.xfReg[0x50 + coord], mtxIdx, GxXfFloat(m), GxXfFloat(m + 1), GxXfFloat(m + 2),
-                    GxXfFloat(m + 3), GxXfFloat(m + 4), GxXfFloat(m + 5), GxXfFloat(m + 6), GxXfFloat(m + 7), GxXfFloat(m + 8), GxXfFloat(m + 9),
-                    GxXfFloat(m + 10), GxXfFloat(m + 11), g_gx.xfReg[0x26] != 0, count);
-            }
-        }
-    }
-    static const bool vpLog = getenv("DSE_VPLOG") != nullptr;
-    if (vpLog)
-    {
-        float vw = std::fabs(GxXfFloat(0x101A)) * 2, vh = std::fabs(GxXfFloat(0x101B)) * 2;
-        float vx = GxXfFloat(0x101D) - 342, vy = GxXfFloat(0x101E) - 342;
-        static std::set<uint64_t> seenVp;
-        uint64_t key = uint64_t(int(vw)) | uint64_t(int(vh)) << 12 | uint64_t(int(vx) & 0xFFF) << 24 | uint64_t(int(vy) & 0xFFF) << 36 |
-            uint64_t(g_gx.xfReg[0x26] != 0) << 48 | uint64_t(g_gx.bp[0x41] & 0xFFF) << 49;
-        if (seenVp.insert(key).second && seenVp.size() < 200)
-            LOG("[vp] %gx%g center %g,%g ortho %u cmode0 %04X zmode %02X count %u draw %u frame %u tex0 0x%08X scissor %06X %06X off %06X",
-                vw, vh, vx, vy, g_gx.xfReg[0x26] != 0, g_gx.bp[0x41] & 0xFFFF, g_gx.bp[0x40] & 0xFF, count, g_frameDrawCount, g_frame,
-                ((g_gx.bp[0x94] & 0xFFFFFF) << 5) | 0x80000000, g_gx.bp[0x20] & 0xFFFFFF, g_gx.bp[0x21] & 0xFFFFFF, g_gx.bp[0x59] & 0xFFFFFF);
-    }
-    static const bool wideSkip = getenv("DSE_WIDESKIP") != nullptr;
-    if (wideSkip && consts.proj1[3] < 0.99f && g_gx.xfReg[0x26] == 0)
-    {
-        float q0 = GxXfFloat(0x1020), q1 = GxXfFloat(0x1021), l = 1e9f, h = -1e9f;
-        bool behind = false;
-        for (uint32_t i = 0; i < count; i++)
-        {
-            uint32_t m = (v[i].idx[0] & 63) * 4;
-            float xv = GxXfFloat(m) * v[i].pos[0] + GxXfFloat(m + 1) * v[i].pos[1] + GxXfFloat(m + 2) * v[i].pos[2] + GxXfFloat(m + 3);
-            float zv = GxXfFloat(m + 8) * v[i].pos[0] + GxXfFloat(m + 9) * v[i].pos[1] + GxXfFloat(m + 10) * v[i].pos[2] + GxXfFloat(m + 11);
-            if (zv >= -1e-6f) { behind = true; break; }
-            float cx = (q0 * xv + q1 * zv) / -zv;
-            l = std::min(l, cx); h = std::max(h, cx);
-        }
-        static const bool skipBehind = getenv("DSE_WIDESKIP")[0] == '2';
-        if (skipBehind ? (behind && (g_gx.bp[0x40] & 0x10) == 0) : (!behind && l < -1.2f && h > 1.2f))
-        {
-            static int logged = 0;
-            if (logged++ < 30)
-                LOG("[wideskip] count %u x %.2f..%.2f cmode0 %04X zmode %02X tex0 0x%08X", count, l, h, g_gx.bp[0x41] & 0xFFFF,
-                    g_gx.bp[0x40] & 0xFF, ((g_gx.bp[0x94] & 0xFFFFFF) << 5) | 0x80000000);
-            return;
         }
     }
     // DSE_GXSTATS=1: how many draws use GX features the backend does not do yet.
@@ -3163,7 +2813,6 @@ void GxBackendCopyToXfb(bool clear)
     static bool shots = getenv("DSE_SHOT") != nullptr;
     static const uint32_t every = getenv("DSE_SHOT_EVERY") ? std::max(1, atoi(getenv("DSE_SHOT_EVERY"))) : 60;
     g_frameDrawCount = 0;
-    g_suspPos = 0;
     static const uint32_t shotFrom = getenv("DSE_SHOT_FROM") ? uint32_t(atoi(getenv("DSE_SHOT_FROM"))) : 0;
     bool shot = shots && (++g_frame % every) == 0 && g_frame >= shotFrom;
     if (!shots)
@@ -3278,16 +2927,6 @@ void GxBackendClear()
     r.bottom = std::min<LONG>(r.top + LONG((dim >> 10) & 0x3FF) + 1, kEfbHeight);
     if (r.right <= r.left || r.bottom <= r.top)
         return;
-    {
-        static const bool zDump = getenv("DSE_ZDUMP") != nullptr;
-        static uint32_t logged = 0;
-        if (zDump && g_frame > 6000 && logged < 40)
-        {
-            logged++;
-            LOG("[zdump] clear (%ld,%ld)-(%ld,%ld) color %06X%02X z %06X frame %u draw %u", r.left, r.top, r.right, r.bottom,
-                g_gx.bp[0x50] & 0xFFFF, g_gx.bp[0x4F] & 0xFF, g_gx.bp[0x51] & 0xFFFFFF, g_frame, g_frameDrawCount);
-        }
-    }
     r = { LONG(r.left * g_scaleX), r.top * LONG(g_scale), LONG(r.right * g_scaleX), r.bottom * LONG(g_scale) };
     g_list->ClearRenderTargetView(Rtv(kBackBuffers), g_clearColor, 1, &r);
     g_list->ClearDepthStencilView(g_dsvHeap->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH,
@@ -3454,8 +3093,7 @@ void GxBackendCopyToTexture(uint32_t value)
     const bool depthCopy = (g_gx.bp[0x43] & 7) == 3 && !noZCopy;
     if (depthCopy)
     {
-        static const bool zdumpTest = getenv("DSE_ZDUMP") != nullptr;
-        k.params[3] = zdumpTest ? 3.0f : 2.0f;
+        k.params[3] = 2.0f;
         g_depthCopyFrame = g_frame;
     }
 
@@ -3529,79 +3167,6 @@ void GxBackendCopyToTexture(uint32_t value)
     g_list->DrawInstanced(3, 1, 0, 0);
     Barrier(e.res.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-    // DSE_ZDUMP=1: read a depth copy back now and then and log its depth values (debugging).
-    static const bool zDump = getenv("DSE_ZDUMP") != nullptr;
-    if (zDump)
-    {
-        static ComPtr<ID3D12Resource> rb;
-        static uint32_t pendingFrame = 0, rbW = 0, rbH = 0, rbPitch = 0;
-        static bool pending = false;
-        if (pending && g_frame >= pendingFrame + 10)
-        {
-            pending = false;
-            void* data = nullptr;
-            D3D12_RANGE all{ 0, SIZE_T(rbPitch) * rbH };
-            if (SUCCEEDED(rb->Map(0, &all, &data)))
-            {
-                uint32_t hist[10] = {};
-                uint32_t zmin = 0xFFFFFF, zmax = 0;
-                uint32_t amin = 255, amax = 0;
-                for (uint32_t y = 0; y < rbH; y++)
-                    for (uint32_t x = 0; x < rbW; x++)
-                    {
-                        const uint8_t* px = (const uint8_t*)data + size_t(y) * rbPitch + x * 4;
-                        uint32_t z = uint32_t(px[0]) << 16 | uint32_t(px[1]) << 8 | px[2];
-                        zmin = std::min(zmin, z);
-                        amin = std::min<uint32_t>(amin, px[0]);
-                        amax = std::max<uint32_t>(amax, px[0]);
-                        zmax = std::max(zmax, z);
-                        hist[std::min(9u, uint32_t(double(z) / 16777216.0 * 10))]++;
-                    }
-                {
-                    uint32_t bmin = 255, bmax = 0;
-                    for (uint32_t y = 0; y < rbH; y++)
-                        for (uint32_t x = 0; x < rbW; x++)
-                        {
-                            uint8_t b = ((const uint8_t*)data)[size_t(y) * rbPitch + x * 4 + 2];
-                            bmin = std::min<uint32_t>(bmin, b);
-                            bmax = std::max<uint32_t>(bmax, b);
-                        }
-                    LOG("[zdump] R (u) %u..%u, G (fixed point) %u, B (depth here) %u..%u", amin, amax,
-                        ((const uint8_t*)data)[1], bmin, bmax);
-                }
-                LOG("[zdump] %ux%u z %06X..%06X (%.5f..%.5f) tenths %u %u %u %u %u %u %u %u %u %u", rbW, rbH, zmin, zmax,
-                    zmin / 16777215.0, zmax / 16777215.0, hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6],
-                    hist[7], hist[8], hist[9]);
-                D3D12_RANGE none{ 0, 0 };
-                rb->Unmap(0, &none);
-            }
-        }
-        if (depthCopy && !pending && g_frame % 150 == 0)
-        {
-            rbW = tw * cs;
-            rbH = th * cs;
-            rbPitch = (rbW * 4 + 255) & ~255u;
-            if (!rb || rb->GetDesc().Width < UINT64(rbPitch) * rbH)
-                rb = CreateBuffer(UINT64(rbPitch) * rbH, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-            Barrier(e.res.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            D3D12_TEXTURE_COPY_LOCATION from{}, to{};
-            from.pResource = e.res.Get();
-            from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            to.pResource = rb.Get();
-            to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            to.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, rbW, rbH, 1, rbPitch };
-            g_list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
-            Barrier(e.res.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            pending = true;
-            pendingFrame = g_frame;
-            LOG("[zdump] copy %ux%u at (%u,%u) frame %u value %06X zclear %06X zmode %06X draws so far %u", w, h, x0, y0,
-                g_frame, value & 0xFFFFFF, g_gx.bp[0x51] & 0xFFFFFF, g_gx.bp[0x40] & 0xFFFFFF, g_frameDrawCount);
-            for (uint32_t i = 0; i < 12; i++)
-                LOG("[zdump]   %s", g_recentDraws[(g_recentDrawPos + i) % 12]);
-            for (uint32_t i = 0; i < g_suspPos; i++)
-                LOG("[zdump] depth writer %s", g_susp[i]);
-        }
-    }
 
     // Back to drawing into the EFB.
     Barrier(g_efb.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);

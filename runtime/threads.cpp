@@ -15,6 +15,7 @@
 // scheduler's idle loop until an interrupt makes a thread ready.
 #include "runtime.h"
 #include "config.h"
+#include "netplay.h"
 void WatchRearm();  // main.cpp (DSE_WATCH)
 #include "audio.h"
 #include "gx.h"
@@ -258,6 +259,18 @@ uint64_t RaiseDueInterrupts(PPCContext& ctx, uint8_t* base)
                 g_nextRetraceTb += kViPeriodTb;
             g_detFrames++;
             InputLatchFrame(g_detFrames);
+            // Online: compare a hash of MEM1 with the other PC every 120 retraces, and show
+            // the session's state in the title bar.
+            if (NetplayActive() && g_detFrames % 120 == 0)
+            {
+                const uint64_t* w = reinterpret_cast<const uint64_t*>(g_base + kMem1Base);
+                uint64_t h = 0xCBF29CE484222325ull;
+                for (uint32_t i = 0; i < kMem1Size / 8; i++)
+                    h = (h ^ w[i]) * 0x100000001B3ull;
+                NetplayReportHash(g_detFrames, h);
+                if (HWND wnd = (HWND)VideoGetWindow())
+                    SetWindowTextW(wnd, (L"Dead Space: Extraction \u00b7 " + NetplayStatusText()).c_str());
+            }
         }
         // DSE_HASHLOG=name (deterministic mode, testing): every 60 retraces, a hash of each
         // 1 MB of MEM1 and MEM2 goes to logs/hash_<name>.txt, to compare two runs.
@@ -432,7 +445,7 @@ void Pump(PPCContext& ctx, uint8_t* base, bool idle)
 bool DeterministicMode()
 {
     static const bool on = getenv("DSE_DETERMINISTIC") != nullptr || ConfigBool("determinista", false);
-    return on;
+    return on || NetplayActive();
 }
 uint64_t DeterministicTimeBase()
 {

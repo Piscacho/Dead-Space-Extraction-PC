@@ -4,6 +4,7 @@
 //
 // Names come from Dolphin's signature database (config/sdk_names.txt) and dtk's symbols.
 #include "runtime.h"
+#include "netplay.h"
 #include "config.h"
 #include "gx.h"
 #include "ios.h"
@@ -215,5 +216,6 @@ PPC_FUNC(sub_803C3750)
 // the backend widens it further for 21:9 and 32:9.
 PPC_FUNC(sub_803E64DC)
 {
-    ctx.r3.u64 = VideoAspect() > 1.5f ? 1 : 0;
+    // Online, both games must see the same value: the host's.
+    ctx.r3.u64 = NetplayActive() ? (NetplayHostWide() ? 1 : 0) : (VideoAspect() > 1.5f ? 1 : 0);
 }

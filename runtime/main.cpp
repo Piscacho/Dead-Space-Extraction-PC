@@ -2,6 +2,7 @@
 // and jump to the game's __start.
 #include "runtime.h"
 #include "config.h"
+#include "netplay.h"
 bool LauncherRun();  // launcher.cpp
 #include <windows.h>
 #include <mmsystem.h>
@@ -485,6 +486,9 @@ int main(int argc, char** argv)
             return 0;
         ConfigLoad();  // what the launcher saved
     }
+    // Online (netplay.cpp): connects and syncs the saves before anything of the game runs.
+    if (NetplayStart())
+        LOG("[online] session ready");
     std::string folder = ConfigString("carpeta_juego", "G:/Dead Space Extraction PC/juego/DATA");
     std::string dolDefault = folder + "/sys/main.dol";
     const char* dolPath = !dolArg.empty() ? dolArg.c_str() : dolDefault.c_str();

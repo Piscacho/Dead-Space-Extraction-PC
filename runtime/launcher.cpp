@@ -46,14 +46,14 @@ const COLORREF kPlayText = RGB(4, 16, 22);
 const wchar_t* kVersion = L"1.0";
 const wchar_t* kAuthor = L"Piscacho";
 
-enum Page { kHome, kGraphics, kControls, kAudio, kAdvanced, kPages };
-const wchar_t* kPageNames[kPages] = { L"INICIO", L"GRÁFICOS", L"CONTROLES", L"AUDIO", L"AVANZADO" };
+enum Page { kHome, kGraphics, kControls, kAudio, kOnline, kAdvanced, kPages };
+const wchar_t* kPageNames[kPages] = { L"INICIO", L"GRÁFICOS", L"CONTROLES", L"AUDIO", L"EN LÍNEA", L"AVANZADO" };
 
 // Hit-test ids.
 enum : int
 {
     kIdPlay = 1, kIdSave, kIdBrowse, kIdOpenLogs, kIdOpenSaves, kIdResetControls, kIdVolume,
-    kIdPageBase = 100, kIdChoiceBase = 1000, kIdToggleBase = 2000, kIdBindBase = 4000,
+    kIdPageBase = 100, kIdChoiceBase = 1000, kIdToggleBase = 2000, kIdBindBase = 4000, kIdTextBase = 5000,
 };
 
 // A setting with fixed choices (shown as  <  value  >).
@@ -91,8 +91,27 @@ const Choice kChoices[] = {
           { "32:9", L"32:9 superultrapanorámico" } }, "4:3" },
     { "mando_jugador2", L"Mando del jugador 2", L"El jugador 1 usa teclado, ratón y el mando 1 (si no es este).",
         { { "0", L"Mando 1" }, { "1", L"Mando 2" }, { "2", L"Mando 3" }, { "3", L"Mando 4" } }, "1" },
+    { "online", L"Modo", L"Al pulsar JUGAR se conecta antes de empezar el juego.",
+        { { "no", L"Desactivado" }, { "crear", L"Crear partida (J1)" }, { "unirse", L"Unirse (J2)" } }, "no" },
+    { "online_retraso", L"Retraso de los controles", L"Más alto aguanta mejor las conexiones lentas; más bajo responde antes.",
+        { { "2", L"2 fotogramas (red local)" }, { "3", L"3 fotogramas" }, { "4", L"4 fotogramas" }, { "5", L"5 fotogramas" },
+          { "6", L"6 fotogramas (lejos)" } }, "3" },
 };
-enum { kChoiceScale, kChoiceFps, kChoiceWindow, kChoicePad, kChoiceAspect, kChoiceP2Pad, kChoiceCount };
+enum { kChoiceScale, kChoiceFps, kChoiceWindow, kChoicePad, kChoiceAspect, kChoiceP2Pad, kChoiceOnline, kChoiceDelay, kChoiceCount };
+
+// Free text settings (an address, a port): click, type, Intro.
+struct TextSetting
+{
+    const char* key;
+    const wchar_t* label;
+    const wchar_t* hint;
+    const char* fallback;
+};
+const TextSetting kTexts[] = {
+    { "online_direccion", L"Dirección del anfitrión", L"La IP:puerto que le aparece al que crea la partida.", "" },
+    { "online_puerto", L"Puerto UDP", L"El anfitrión lo abre en su router (UPnP automático) o en su VPN.", "7350" },
+};
+enum { kTextAddress, kTextPort, kTextCount };
 
 const Toggle kToggles[] = {
     { "pantalla_completa", L"Pantalla completa", L"Sin bordes, en el monitor de la ventana.", false },
@@ -124,6 +143,7 @@ struct State
     WORD padBefore = 0;        // gamepad buttons held when the capture started
     int scroll = 0;            // controls page
     int dragVolume = false;
+    int editing = -1;          // text setting being typed
     std::wstring status;
     HBITMAP banner = nullptr;
     int bannerW = 0, bannerH = 0;
@@ -679,6 +699,50 @@ void PaintAudio(HDC dc, RECT area)
     ToggleRow(dc, x, y, w, kToggleEffects);
 }
 
+// A text setting: label and hint, and an edit box (cyan with a caret while typing).
+void TextRow(HDC dc, int x, int& y, int w, int i)
+{
+    const TextSetting& t = kTexts[i];
+    RowLabel(dc, x, y, w, t.label, t.hint);
+    int bw = S(250), bx = x + w - bw;
+    RECT box{ bx, y, bx + bw, y + S(34) };
+    int id = kIdTextBase + i;
+    bool editing = g.editing == i;
+    Chamfer(dc, box, S(6), editing ? kPanelHi : kPanel, editing || Hovered(id) ? kCyan : kLine);
+    std::wstring v = Wide(IniValue(t.key, t.fallback));
+    if (editing && (GetTickCount64() / 500) % 2 == 0)
+        v += L"|";
+    RECT tr{ box.left + S(12), box.top, box.right - S(12), box.bottom };
+    Text(dc, v.empty() ? L"(escribe aquí)" : v, tr, v.empty() ? kMuted : kText, g.body, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    AddHit(box, id);
+    y += S(54);
+}
+
+void PaintOnline(HDC dc, RECT area)
+{
+    int x = area.left, w = area.right - area.left, y = area.top;
+    y = Section(dc, x, y, w, L"JUEGO EN LÍNEA  ·  COOPERATIVO PARA 2");
+    ChoiceRow(dc, x, y, w, kChoiceOnline);
+    std::string mode = IniValue("online", "no");
+    if (mode == "unirse")
+        TextRow(dc, x, y, w, kTextAddress);
+    if (mode != "no")
+    {
+        TextRow(dc, x, y, w, kTextPort);
+        ChoiceRow(dc, x, y, w, kChoiceDelay);
+    }
+    RECT card{ x, y + S(4), area.right, y + S(4) + S(124) };
+    FillAlpha(dc, card, RGB(5, 12, 17), 200, S(10));
+    Chamfer(dc, card, S(10), CLR_NONE, kLine);
+    RECT t{ card.left + S(16), card.top + S(10), card.right - S(16), card.bottom - S(10) };
+    const wchar_t* help =
+        L"Los dos PCs ejecutan el juego y solo se envían los controles: los dos necesitáis el mismo DSE.exe y vuestra "
+        L"copia del juego. El que crea la partida es el jugador 1 y lleva su partida guardada; el que se une es el "
+        L"jugador 2.\n\nEl anfitrión ve su dirección al pulsar JUGAR. Por internet, su router debe dejar pasar el "
+        L"puerto UDP (se intenta abrir solo con UPnP); si no, usad una VPN como Radmin VPN o ZeroTier y la IP que os dé.";
+    Text(dc, help, t, kMuted, g.smallFont, DT_LEFT | DT_TOP | DT_WORDBREAK);
+}
+
 void PaintAdvanced(HDC dc, RECT area)
 {
     int x = area.left, w = area.right - area.left, y = area.top;
@@ -710,7 +774,7 @@ void Paint(HDC dc, RECT rc)
     g.hits.clear();
     FillRectColor(dc, rc, kBg);
     // Background: a picture of the game for each page, darkened, under scanlines.
-    static const int kPageArt[kPages] = { kPicMarker, kPicAegis, kPicIshimura, kPicMarker, kPicAegis };
+    static const int kPageArt[kPages] = { kPicMarker, kPicAegis, kPicIshimura, kPicMarker, kPicIshimura, kPicAegis };
     int art = kPageArt[g.page];
     if (HasPicture(art))
     {
@@ -756,7 +820,7 @@ void Paint(HDC dc, RECT rc)
         if (active)
             Line(dc, r.left + S(10), r.top + S(14), r.left + S(10), r.bottom - S(14), kCyan, S(3));
         AddHit(r, id);
-        y += S(52);
+        y += S(46);
     }
     // The Wii box at the bottom of the sidebar, if there is room for it.
     if (HasPicture(kPicCover))
@@ -799,6 +863,7 @@ void Paint(HDC dc, RECT rc)
     case kGraphics: PaintGraphics(dc, content); break;
     case kControls: PaintControls(dc, content); break;
     case kAudio: PaintAudio(dc, content); break;
+    case kOnline: PaintOnline(dc, content); break;
     default: PaintAdvanced(dc, content); break;
     }
 
@@ -883,6 +948,12 @@ void SetVolumeFromX(int mx)
 
 void Click(int id, bool right)
 {
+    if (id >= kIdTextBase && id < kIdTextBase + kTextCount)
+    {
+        g.editing = id - kIdTextBase;
+        return;
+    }
+    g.editing = -1;
     if (id >= kIdPageBase && id < kIdPageBase + kPages)
     {
         g.page = Page(id - kIdPageBase);
@@ -1080,8 +1151,36 @@ LRESULT CALLBACK LauncherProc(HWND h, UINT m, WPARAM w, LPARAM l)
             InvalidateRect(h, nullptr, FALSE);
         }
         return 0;
+    case WM_CHAR:
+        if (g.editing >= 0)
+        {
+            const char* key = kTexts[g.editing].key;
+            std::string v = IniValue(key, kTexts[g.editing].fallback);
+            if (w == 8)  // backspace
+            {
+                if (!v.empty())
+                    v.pop_back();
+            }
+            else if (w == 13 || w == 27)
+                g.editing = -1;
+            else if (w >= 32 && w < 127 && v.size() < 64)
+                v += char(w);
+            SetIni(key, v);
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
+        break;
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
+        if (g.editing >= 0)
+        {
+            if (w == VK_RETURN || w == VK_ESCAPE)
+            {
+                g.editing = -1;
+                InvalidateRect(h, nullptr, FALSE);
+            }
+            return 0;  // the characters come with WM_CHAR
+        }
         if (g.capture >= 0 && !(g.capture & 1))
         {
             if (w == VK_ESCAPE)
@@ -1111,6 +1210,15 @@ LRESULT CALLBACK LauncherProc(HWND h, UINT m, WPARAM w, LPARAM l)
         break;
     case WM_TIMER:
         PollPadCapture();
+        if (g.editing >= 0)  // the caret blinks
+        {
+            static ULONGLONG last = 0;
+            if (GetTickCount64() - last >= 500)
+            {
+                last = GetTickCount64();
+                InvalidateRect(h, nullptr, FALSE);
+            }
+        }
         return 0;
     case WM_CLOSE:
         if (g.dirty && MessageBoxW(h, L"Hay cambios sin guardar. ¿Guardarlos antes de salir?", L"Dead Space: Extraction",

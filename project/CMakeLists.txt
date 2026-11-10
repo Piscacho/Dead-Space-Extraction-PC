@@ -33,10 +33,11 @@ add_executable(DSE
     ${RECOMP_ROOT}/runtime/config.cpp
     ${RECOMP_ROOT}/runtime/bindings.cpp
     ${RECOMP_ROOT}/runtime/launcher.cpp
+    ${RECOMP_ROOT}/runtime/netplay.cpp
     ${RECOMP_ROOT}/runtime/dse.rc)
 target_include_directories(DSE PRIVATE ${RECOMP_ROOT}/runtime)
 target_compile_options(DSE PRIVATE /O2 -fno-strict-aliasing -msse4.1 -Wno-unused-parameter /Z7 "/FI${RECOMP_ROOT}/tools/ppc_indirect.h")
 target_compile_definitions(DSE PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-target_link_libraries(DSE PRIVATE DSERecompLib user32 gdi32 dbghelp d3d12 dxgi d3dcompiler xinput ole32 dwmapi shell32 winmm)
+target_link_libraries(DSE PRIVATE DSERecompLib ws2_32 winhttp user32 gdi32 dbghelp d3d12 dxgi d3dcompiler xinput ole32 dwmapi shell32 winmm)
 # Windowed app: no console window (the log goes to logs/juego.log, see main.cpp).
 target_link_options(DSE PRIVATE /DEBUG /STACK:0x4000000 /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)

@@ -1,6 +1,7 @@
 // IOS devices. Each one answers the requests the game makes; anything not handled yet is
 // logged once (with its command) and answered with a neutral result.
 #include "runtime.h"
+#include "netplay.h"
 #include "disc.h"
 #include "ios.h"
 #include <windows.h>
@@ -36,7 +37,8 @@ static fs::path NandRoot()
     static fs::path root = [] {
         wchar_t exe[MAX_PATH];
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
-        fs::path p = fs::path(exe).parent_path() / "user" / "nand";
+        // Online, the guest plays with the host's saves (copied to nand_online by netplay.cpp).
+        fs::path p = fs::path(exe).parent_path() / "user" / (NetplayActive() && !NetplayIsHost() ? "nand_online" : "nand");
         fs::create_directories(p);
         LOG("[nand] root %s", p.string().c_str());
         return p;

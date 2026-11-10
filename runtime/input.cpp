@@ -17,6 +17,7 @@
 #include "config.h"
 #include "gx.h"
 #include "ios.h"
+#include "netplay.h"
 #include <ppc_recomp_shared.h>
 #include <windows.h>
 #include <xinput.h>
@@ -161,13 +162,14 @@ void Apply(int action, struct HostInput& in);
 // played with the Xbox controller mando_jugador2 (0-3, default 1, i.e. the second one).
 // Player 1 keeps keyboard, mouse and controller mando_jugador1 (default 0; -1 none, and none
 // when both settings name the same controller).
-bool SecondPlayer() { static const bool on = ConfigBool("jugador2", false); return on; }
+bool SecondPlayer() { static const bool on = ConfigBool("jugador2", false); return on || NetplayActive(); }
 int PadOf(int player)
 {
     static const int p2 = std::clamp(ConfigInt("mando_jugador2", 1), 0, 3);
     static const int p1 = [] {
         int v = ConfigInt("mando_jugador1", 0);
-        return (v < 0 || v > 3 || (SecondPlayer() && v == p2)) ? -1 : v;
+        // Online the other player is on the other PC: this PC's controller is player 1's.
+        return (v < 0 || v > 3 || (ConfigBool("jugador2", false) && !NetplayActive() && v == p2)) ? -1 : v;
     }();
     return player == 0 ? p1 : (SecondPlayer() ? p2 : -1);
 }
@@ -288,12 +290,54 @@ PPC_FUNC(sub_803EECC8)  // WPADSetExtensionCallback(chan, callback): returns the
 // Deterministic mode: the host input is read once per video retrace (InputLatchFrame, from
 // the retrace interrupt) and every KPADRead of that frame returns it, so what the game sees
 // depends only on the frame number, not on when the PC happened to poll.
+void ApplyTestHelpers(HostInput& in);
 HostInput g_latched[2];
 bool g_haveLatched = false;
+NetInput PackNet(const HostInput& in)
+{
+    auto q16 = [](float v) { return int16_t(std::lround(std::fmax(-1.0f, std::fmin(1.0f, v)) * 32767.0f)); };
+    auto q8 = [](float v) { return int8_t(std::lround(std::fmax(-1.0f, std::fmin(1.0f, v)) * 127.0f)); };
+    NetInput n;
+    n.buttons = in.buttons;
+    n.pointer[0] = q16(in.pointer[0]);
+    n.pointer[1] = q16(in.pointer[1]);
+    n.stick[0] = q8(in.stick[0]);
+    n.stick[1] = q8(in.stick[1]);
+    n.flags = uint8_t((in.pointerValid ? 1 : 0) | (in.shakeRemote ? 2 : 0) | (in.shakeNunchuk ? 4 : 0) | (in.tilt ? 8 : 0));
+    return n;
+}
+HostInput UnpackNet(const NetInput& n)
+{
+    HostInput in;
+    in.buttons = n.buttons;
+    in.pointer[0] = n.pointer[0] / 32767.0f;
+    in.pointer[1] = n.pointer[1] / 32767.0f;
+    in.stick[0] = n.stick[0] / 127.0f;
+    in.stick[1] = n.stick[1] / 127.0f;
+    in.pointerValid = (n.flags & 1) != 0;
+    in.shakeRemote = (n.flags & 2) != 0;
+    in.shakeNunchuk = (n.flags & 4) != 0;
+    in.tilt = (n.flags & 8) != 0;
+    return in;
+}
+
 void InputLatchFrame(uint32_t frame)
 {
-    (void)frame;
+    if (NetplayActive())
+    {
+        // Online: this PC's player (keyboard, mouse, controller) goes out to the other PC;
+        // both get exactly the same (quantized) controls for this frame.
+        NetInput both[2];
+        HostInput local = ReadHost(0);
+        ApplyTestHelpers(local);
+        NetplayExchange(frame, PackNet(local), both);
+        g_latched[0] = UnpackNet(both[0]);
+        g_latched[1] = UnpackNet(both[1]);
+        g_haveLatched = true;
+        return;
+    }
     g_latched[0] = ReadHost(0);
+    ApplyTestHelpers(g_latched[0]);
     g_latched[1] = SecondPlayer() ? ReadHost(1) : HostInput{};
     g_haveLatched = true;
 }
@@ -306,7 +350,9 @@ PPC_FUNC(sub_803EF0A0)
     uint32_t chan = ctx.r3.u32, on = ctx.r4.u32;
     if (!enabled || chan > 1)
         return;
-    int pad = PadOf(int(chan));
+    if (NetplayActive() && int(chan) != NetplayLocalPlayer())
+        return;  // the other player's rumble belongs to the other PC
+    int pad = PadOf(NetplayActive() ? 0 : int(chan));
     if (pad < 0)
         return;
     static uint32_t state[2] = { 2, 2 };
@@ -319,34 +365,11 @@ PPC_FUNC(sub_803EF0A0)
     XInputSetState(DWORD(pad), &v);
 }
 
-// KPADRead(chan, samples, max): returns the number of samples written.
-PPC_FUNC(sub_803FEF18)
+// The test helpers (DSE_AUTOPRESS, DSE_AUTOPOINT, DSE_AUTOSCRIPT) on top of this PC's
+// controls. In deterministic and online mode they act once per retrace, before the
+// controls are latched or sent, so both PCs see them.
+void ApplyTestHelpers(HostInput& in)
 {
-    uint32_t chan = ctx.r3.u32, buf = ctx.r4.u32, max = ctx.r5.u32;
-    if (!buf || !max)
-    {
-        ctx.r3.s64 = 0;
-        return;
-    }
-    memset(g_base + buf, 0, kSampleSize);
-    if (chan > 1 || (chan == 1 && !SecondPlayer()))
-    {
-        Store8(buf + 0x5D, uint8_t(-1));  // WPAD_ERR_NO_CONTROLLER
-        ctx.r3.s64 = 0;
-        return;
-    }
-
-    static bool logged = false;
-    if (!logged)
-    {
-        logged = true;
-        LOG("[input] KPADRead: channel 0 = Wii Remote + Nunchuk (mouse, keyboard, XInput)");
-    }
-
-    const int player = int(chan);
-    HostInput in = DeterministicMode() ? (g_haveLatched ? g_latched[player] : HostInput{}) : ReadHost(player);
-    if (player == 0)  // the test helpers are player 1's
-    {
     // DSE_AUTOPRESS=1 (testing): press A for 6 reads out of every 120; =B presses B (the
     // Zapper trigger), =AB alternates A and B.
     // DSE_AUTOPRESS_STOP=<s> stops pressing after that many seconds; DSE_AUTOPOINT_AFTER=<s>
@@ -428,7 +451,36 @@ PPC_FUNC(sub_803FEF18)
             }
         }
     }
+}
+
+// KPADRead(chan, samples, max): returns the number of samples written.
+PPC_FUNC(sub_803FEF18)
+{
+    uint32_t chan = ctx.r3.u32, buf = ctx.r4.u32, max = ctx.r5.u32;
+    if (!buf || !max)
+    {
+        ctx.r3.s64 = 0;
+        return;
     }
+    memset(g_base + buf, 0, kSampleSize);
+    if (chan > 1 || (chan == 1 && !SecondPlayer()))
+    {
+        Store8(buf + 0x5D, uint8_t(-1));  // WPAD_ERR_NO_CONTROLLER
+        ctx.r3.s64 = 0;
+        return;
+    }
+
+    static bool logged = false;
+    if (!logged)
+    {
+        logged = true;
+        LOG("[input] KPADRead: channel 0 = Wii Remote + Nunchuk (mouse, keyboard, XInput)");
+    }
+
+    const int player = int(chan);
+    HostInput in = DeterministicMode() ? (g_haveLatched ? g_latched[player] : HostInput{}) : ReadHost(player);
+    if (player == 0 && !DeterministicMode())
+        ApplyTestHelpers(in);
     uint32_t hold = in.buttons;
     Store32(buf + 0x00, hold);
     Store32(buf + 0x04, hold & ~g_prevHold[player]);   // pressed this frame

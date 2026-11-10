@@ -20,6 +20,7 @@ static int g_dlDepth = 0;  // DSE_PROF: time decoding vertices
 #include <cstdlib>
 #include <unordered_map>
 #include "gx.h"
+#include <xmmintrin.h>
 #include "gx_state.h"
 #include "gx_texture.h"
 #include <cstring>
@@ -310,6 +311,15 @@ void Process()
 
 void Append(const uint8_t* bytes, size_t n)
 {
+    // The commands run D3D12 (and driver) code on the game's thread, which may leave the
+    // SSE control register (rounding, denormals) changed. The game's float code depends on
+    // it, so it is put back: otherwise results differ with the interpolation setting or
+    // between PCs, and online play desyncs.
+    struct MxcsrGuard
+    {
+        unsigned saved = _mm_getcsr();
+        ~MxcsrGuard() { _mm_setcsr(saved); }
+    } mxcsr;
     g_stats.bytes += n;
     g_fifo.insert(g_fifo.end(), bytes, bytes + n);
     Process();

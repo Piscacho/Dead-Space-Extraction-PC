@@ -38,3 +38,13 @@ void InitLowMemory();
 
 // Threads (threads.cpp): turns the host thread into the first guest thread's fiber.
 void InitGuestThreads(PPCContext* mainCtx);
+
+// Deterministic mode (threads.cpp; DSE_DETERMINISTIC=1, and online play): the guest's time
+// base is a virtual clock that only moves with what the game does, and every interrupt
+// (video retrace, audio, alarms) fires at a fixed point of it, so the same input gives the
+// same result on any PC. The PC clock only paces it (it waits at each retrace when ahead).
+bool DeterministicMode();
+uint64_t DeterministicTimeBase();      // the virtual time base (advances a little per read)
+uint32_t DeterministicFrame();         // video retraces delivered so far
+// Input is latched once per retrace in this mode (input.cpp).
+void InputLatchFrame(uint32_t frame);

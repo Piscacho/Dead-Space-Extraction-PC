@@ -285,6 +285,19 @@ PPC_FUNC(sub_803EECC8)  // WPADSetExtensionCallback(chan, callback): returns the
     }
 }
 
+// Deterministic mode: the host input is read once per video retrace (InputLatchFrame, from
+// the retrace interrupt) and every KPADRead of that frame returns it, so what the game sees
+// depends only on the frame number, not on when the PC happened to poll.
+HostInput g_latched[2];
+bool g_haveLatched = false;
+void InputLatchFrame(uint32_t frame)
+{
+    (void)frame;
+    g_latched[0] = ReadHost(0);
+    g_latched[1] = SecondPlayer() ? ReadHost(1) : HostInput{};
+    g_haveLatched = true;
+}
+
 // WPADControlMotor(chan, command): the remote's rumble (1 on, 0 off) goes to the Xbox
 // controller of that player. vibracion = 0 in dse.ini turns it off. Returns nothing.
 PPC_FUNC(sub_803EF0A0)
@@ -331,7 +344,7 @@ PPC_FUNC(sub_803FEF18)
     }
 
     const int player = int(chan);
-    HostInput in = ReadHost(player);
+    HostInput in = DeterministicMode() ? (g_haveLatched ? g_latched[player] : HostInput{}) : ReadHost(player);
     if (player == 0)  // the test helpers are player 1's
     {
     // DSE_AUTOPRESS=1 (testing): press A for 6 reads out of every 120; =B presses B (the
@@ -341,7 +354,9 @@ PPC_FUNC(sub_803FEF18)
     static const char* autoPress = getenv("DSE_AUTOPRESS");
     static uint32_t reads = 0;
     static ULONGLONG start = GetTickCount64();
-    double seconds = double(GetTickCount64() - start) / 1000.0;
+    // The test helpers run on the game's own clock in deterministic mode (retraces).
+    double seconds = DeterministicMode() ? DeterministicFrame() * 1001.0 / 60000.0
+                                         : double(GetTickCount64() - start) / 1000.0;
     static double pressStop = getenv("DSE_AUTOPRESS_STOP") ? atof(getenv("DSE_AUTOPRESS_STOP")) : 1e30;
     static double pointAfter = getenv("DSE_AUTOPOINT_AFTER") ? atof(getenv("DSE_AUTOPOINT_AFTER")) : 0.0;
     if (autoPress && seconds < pressStop && (reads++ % 120) < 6)

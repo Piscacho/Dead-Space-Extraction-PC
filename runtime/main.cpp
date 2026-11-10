@@ -178,6 +178,8 @@ bool ppc_stwcx32(uint8_t* base, uint32_t ea, uint32_t expectedRaw, uint32_t newR
 // Wii time base: bus clock / 4 = 60.75 MHz.
 uint64_t ppc_mftb()
 {
+    if (DeterministicMode())
+        return DeterministicTimeBase();
     static LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
     constexpr uint64_t tb = 243000000ull / 4;
     LARGE_INTEGER c;

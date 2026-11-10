@@ -14,12 +14,14 @@
 // alarms (decrementer). It runs when the game re-enables interrupts, and blocks in the
 // scheduler's idle loop until an interrupt makes a thread ready.
 #include "runtime.h"
+#include "config.h"
 void WatchRearm();  // main.cpp (DSE_WATCH)
 #include "audio.h"
 #include "gx.h"
 #include "ios.h"
 #include <ppc_recomp_shared.h>
 #include <windows.h>
+#include <algorithm>
 #include <csetjmp>
 #include <unordered_map>
 
@@ -182,6 +184,49 @@ constexpr uint32_t kAiAddrHi = 0xCC005030, kAiAddrLo = 0xCC005032, kAiControl = 
 uint32_t g_retraces = 0;
 bool g_pumping = false;
 
+// --- Deterministic mode ------------------------------------------------------------------
+// Virtual time base in Wii ticks (60.75 MHz). It advances by a small step on every time
+// base read and every interrupt check (so polling loops make progress), and jumps to the
+// next event when no thread can run. The PC clock never decides anything.
+constexpr uint64_t kTbPerSecond = 243000000ull / 4;
+constexpr uint64_t kViPeriodTb = kTbPerSecond * 1001 / 60000;  // 59.94 Hz
+constexpr uint64_t kReadStepTb = 16;                           // per time base read
+constexpr uint64_t kPumpStepTb = 600;                          // per interrupt check (~10 us)
+uint64_t g_vtb = 0x0000000100000000ull;                       // arbitrary, the same everywhere
+uint64_t g_nextRetraceTb = 0, g_nextAiTb = 0;
+uint64_t g_hostOrigin = 0;                                     // host time of virtual time 0 (100 ns)
+uint64_t g_vtbOrigin = 0;
+uint32_t g_detFrames = 0;
+
+// Waits until the PC clock reaches the virtual time (runs the game at real speed; when the
+// PC is slower, the game just runs slower, the same on every PC).
+void PaceToHost()
+{
+    uint64_t now = HostNow100ns();
+    if (g_hostOrigin == 0)
+    {
+        g_hostOrigin = now;
+        g_vtbOrigin = g_vtb;
+    }
+    uint64_t target = g_hostOrigin + (g_vtb - g_vtbOrigin) * 10000000ull / kTbPerSecond;
+    if (target > now + 2000000)  // more than 200 ms ahead (after a long stall): re-sync
+    {
+        g_hostOrigin = now - (g_vtb - g_vtbOrigin) * 10000000ull / kTbPerSecond;
+        return;
+    }
+    while (target > now)
+    {
+        uint64_t ms = (target - now) / 10000;
+        if (ms >= 2)
+            Sleep(DWORD(ms - 1));
+        else
+            SwitchToThread();
+        now = HostNow100ns();
+    }
+    if (now > target + 2000000)  // far behind (slow PC or a stall): stop owing time
+        g_hostOrigin = now - (g_vtb - g_vtbOrigin) * 10000000ull / kTbPerSecond;
+}
+
 uint64_t GuestSystemTime()
 {
     uint64_t offset = (uint64_t(Load32(kSystemTimeOffset)) << 32) | Load32(kSystemTimeOffset + 4);
@@ -194,15 +239,55 @@ uint64_t RaiseDueInterrupts(PPCContext& ctx, uint8_t* base)
 {
     DeliverIosCallbacks(ctx, base);
 
+    const bool det = DeterministicMode();
     uint64_t now = HostNow100ns();
     if (g_nextRetrace == 0)
         g_nextRetrace = now + kViPeriod100ns;
+    if (det && g_nextRetraceTb == 0)
+        g_nextRetraceTb = g_vtb + kViPeriodTb;
     uint32_t table = Load32(kInterruptHandlerTable);
-    if (now >= g_nextRetrace)
+    bool retrace = det ? g_vtb >= g_nextRetraceTb : now >= g_nextRetrace;
+    if (retrace)
     {
         // Skip missed retraces instead of raising a burst of them.
         while (g_nextRetrace <= now)
             g_nextRetrace += kViPeriod100ns;
+        if (det)
+        {
+            while (g_nextRetraceTb <= g_vtb)
+                g_nextRetraceTb += kViPeriodTb;
+            g_detFrames++;
+            InputLatchFrame(g_detFrames);
+        }
+        // DSE_HASHLOG=name (deterministic mode, testing): every 60 retraces, a hash of each
+        // 1 MB of MEM1 and MEM2 goes to logs/hash_<name>.txt, to compare two runs.
+        static const char* hashName = getenv("DSE_HASHLOG");
+        if (det && hashName && g_detFrames % 60 == 0)
+        {
+            static FILE* f = [] {
+                char path[260];
+                snprintf(path, sizeof(path), "%s/hash_%s.txt", LogFolder().c_str(), getenv("DSE_HASHLOG"));
+                return fopen(path, "w");
+            }();
+            if (f)
+            {
+                fprintf(f, "frame %u tb %llu", g_detFrames, (unsigned long long)g_vtb);
+                for (uint32_t region : { kMem1Base, kMem2Base })
+                {
+                    uint32_t size = region == kMem1Base ? kMem1Size : kMem2Size;
+                    for (uint32_t off = 0; off < size; off += 0x100000)
+                    {
+                        const uint64_t* w = reinterpret_cast<const uint64_t*>(g_base + region + off);
+                        uint64_t h = 0xCBF29CE484222325ull;
+                        for (uint32_t i = 0; i < 0x100000 / 8; i++)
+                            h = (h ^ w[i]) * 0x100000001B3ull;
+                        fprintf(f, " %08llx", (unsigned long long)(h & 0xFFFFFFFF));
+                    }
+                }
+                fputc('\n', f);
+                fflush(f);
+            }
+        }
         uint32_t handler = table ? Load32(table + kViInterrupt * 4) : 0;
         if (handler)
         {
@@ -219,6 +304,8 @@ uint64_t RaiseDueInterrupts(PPCContext& ctx, uint8_t* base)
         }
         VideoPresent();
         WatchRearm();
+        if (det)
+            PaceToHost();
     }
 
     // AI DMA (audio): while DMA is on (0xCC005036 bit 15), the block set up with AIInitDMA
@@ -232,18 +319,27 @@ uint64_t RaiseDueInterrupts(PPCContext& ctx, uint8_t* base)
         uint64_t period = bytes ? uint64_t(bytes / 4) * 10000000ull / 32000 : 30000;
         if (g_nextAi == 0)
             g_nextAi = now;
+        if (det && g_nextAiTb == 0)
+            g_nextAiTb = g_vtb;
         // With a sound card, its clock sets the pace: a block is due whenever less than
-        // ~100 ms is queued. Without one, the PC clock does.
+        // ~100 ms is queued. Without one, the PC clock does. In deterministic mode the
+        // virtual clock does (a block every period), and the sound card only plays them
+        // (a block is dropped when more than 300 ms are already waiting).
         constexpr int64_t kQueueTarget = 32000 / 10;
         int64_t queued = AudioQueuedFrames();
         auto due = [&]() {
+            if (det)
+                return g_vtb >= g_nextAiTb;
             return queued >= 0 ? AudioQueuedFrames() < kQueueTarget : now >= g_nextAi;
         };
         int burst = 0;
         while (due() && burst++ < 16)
         {
-            AudioPushBigEndianRL(g_base + addr, bytes / 4);
+            if (!det || AudioQueuedFrames() < 32000 * 3 / 10)
+                AudioPushBigEndianRL(g_base + addr, bytes / 4);
             g_nextAi += period;
+            if (det)
+                g_nextAiTb += uint64_t(bytes / 4) * kTbPerSecond / 32000 + (bytes ? 0 : kTbPerSecond / 1000);
             uint32_t handler = table ? Load32(table + kAiInterrupt * 4) : 0;
             if (handler)
                 RunHandler(ctx, base, handler, kAiInterrupt, Load32(kCurrentContext));
@@ -254,7 +350,10 @@ uint64_t RaiseDueInterrupts(PPCContext& ctx, uint8_t* base)
             g_nextAi = now + period;  // far behind: skip instead of catching up
     }
     else
+    {
         g_nextAi = 0;
+        g_nextAiTb = 0;
+    }
 
     // PE interrupts raised by the command stream (draw sync tokens, draw done).
     if (uint32_t gx = GxTakePendingInterrupts())
@@ -283,11 +382,32 @@ void Pump(PPCContext& ctx, uint8_t* base, bool idle)
     if (g_pumping)
         return;
     g_pumping = true;
+    const bool det = DeterministicMode();
+    if (det)
+        g_vtb += kPumpStepTb;
     for (;;)
     {
         uint64_t next = RaiseDueInterrupts(ctx, base);
         if (!idle || Load32(kRunQueueBits) != 0)
             break;
+        if (det)
+        {
+            // Idle: the virtual clock jumps to the next event (retrace, audio block or
+            // alarm). Pending IOS replies are delivered by the next check right away.
+            uint64_t target = g_nextRetraceTb;
+            if (g_nextAiTb && g_nextAiTb < target)
+                target = g_nextAiTb;
+            if (uint32_t alarm = Load32(kAlarmQueue))
+            {
+                uint64_t fire = (uint64_t(Load32(alarm + 8)) << 32) | Load32(alarm + 12);
+                uint64_t offset = (uint64_t(Load32(kSystemTimeOffset)) << 32) | Load32(kSystemTimeOffset + 4);
+                uint64_t tb = fire - offset;
+                if (tb > g_vtb && tb < target)
+                    target = tb;
+            }
+            g_vtb = std::max(g_vtb + kPumpStepTb, target);
+            continue;
+        }
         // Idle: nothing can run until an interrupt readies a thread. Sleep until the next
         // retrace, or 1 ms when an alarm or IOS reply may come sooner.
         uint64_t now = HostNow100ns();
@@ -308,6 +428,18 @@ void Pump(PPCContext& ctx, uint8_t* base, bool idle)
     }
 }
 } // namespace
+
+bool DeterministicMode()
+{
+    static const bool on = getenv("DSE_DETERMINISTIC") != nullptr || ConfigBool("determinista", false);
+    return on;
+}
+uint64_t DeterministicTimeBase()
+{
+    g_vtb += kReadStepTb;
+    return g_vtb;
+}
+uint32_t DeterministicFrame() { return g_detFrames; }
 
 void InitGuestThreads(PPCContext* mainCtx)
 {

@@ -5,6 +5,8 @@
 #include "netplay.h"
 bool LauncherRun();  // launcher.cpp
 #include <windows.h>
+#include <exception>
+#include <csignal>
 #include <mmsystem.h>
 #pragma comment(lib, "winmm.lib")
 #include <unordered_map>
@@ -193,6 +195,48 @@ uint64_t ppc_mftb()
 // Diagnostics
 
 static std::string HostSymbol(uintptr_t addr);
+
+// Ways to die that skip the exception handler: abort(), std::terminate (an uncaught C++
+// exception such as std::bad_alloc), the CRT's invalid-parameter check and pure virtual
+// calls. Each one leaves a line (and the host stack) in the log before the process ends.
+static void LogHostStack(const char* why)
+{
+    void* frames[32];
+    USHORT n = RtlCaptureStackBackTrace(1, 32, frames, nullptr);
+    std::string line = std::string("[crash] ") + why + " | stack:";
+    for (USHORT i = 0; i < n; i++)
+        line += " " + HostSymbol((uintptr_t)frames[i]);
+    LOG("%s", line.c_str());
+}
+static void InstallExitReporters()
+{
+    std::set_terminate([] {
+        const char* what = "std::terminate";
+        try
+        {
+            if (auto e = std::current_exception())
+                std::rethrow_exception(e);
+        }
+        catch (const std::exception& ex)
+        {
+            LOG("[crash] uncaught C++ exception: %s", ex.what());
+        }
+        catch (...)
+        {
+        }
+        LogHostStack(what);
+        fflush(stderr);
+        TerminateProcess(GetCurrentProcess(), 3);
+    });
+    signal(SIGABRT, [](int) { LogHostStack("abort()"); fflush(stderr); TerminateProcess(GetCurrentProcess(), 3); });
+    _set_invalid_parameter_handler([](const wchar_t*, const wchar_t*, const wchar_t*, unsigned, uintptr_t) {
+        LogHostStack("CRT invalid parameter");
+        fflush(stderr);
+        TerminateProcess(GetCurrentProcess(), 4);
+    });
+    _set_purecall_handler([] { LogHostStack("pure virtual call"); fflush(stderr); TerminateProcess(GetCurrentProcess(), 5); });
+    atexit([] { LOG("[runtime] process exiting (exit() called)"); });
+}
 
 static LONG CALLBACK CrashHandler(EXCEPTION_POINTERS* e)
 {
@@ -467,6 +511,7 @@ int main(int argc, char** argv)
             freopen("NUL", "w", stderr);
     }
     AddVectoredExceptionHandler(1, CrashHandler);
+    InstallExitReporters();
     // Room on the stack for the crash report even after a stack overflow (it applies to the
     // guest threads' fibers too: the guarantee belongs to the host thread).
     ULONG guarantee = 256 * 1024;

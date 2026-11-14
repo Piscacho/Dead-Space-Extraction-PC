@@ -9,6 +9,7 @@
 #include "config.h"
 #include "gx.h"
 #include "gx_state.h"
+#include "netplay.h"
 #include <windows.h>
 #include <algorithm>
 #include <atomic>
@@ -104,6 +105,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 1;
     case WM_CLOSE:
         LOG("[video] window closed");
+        NetplayShutdown();  // online: the other PC learns it right away
         ExitProcess(0);
     default:
         break;

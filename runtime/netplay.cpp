@@ -31,6 +31,7 @@
 #include <thread>
 #include <vector>
 
+void* VideoGetWindow();  // video.cpp
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "winhttp.lib")
 
@@ -80,6 +81,7 @@ uint32_t g_remoteWants = 0;               // first frame of ours the other PC ha
 uint32_t g_contiguous = 0;                // first remote frame we do not have
 std::map<uint32_t, uint64_t> g_localHash, g_remoteHash;
 bool g_desync = false;
+bool g_lost = false;           // the other player left or stopped answering
 uint32_t g_desyncFrame = 0;
 std::atomic<uint32_t> g_rttMs{ 0 };
 uint64_t g_lastRecv = 0;
@@ -264,7 +266,7 @@ void HandlePacket(const uint8_t* d, int n, const sockaddr_in& from)
         break;
     case kBye:
         LOG("[online] the other player left");
-        g_running = false;
+        g_lost = true;
         g_cv.notify_all();
         break;
     }
@@ -801,8 +803,8 @@ void NetplayExchange(uint32_t frame, const NetInput& local, NetInput out[2])
     out[1 - me] = NetInput{};
     if (frame < uint32_t(g_delay) || !g_running)
         return;
-    uint64_t start = NowMs(), lastSend = start;
-    while (g_running && (frame >= g_haveRemote.size() || !g_haveRemote[frame]))
+    uint64_t start = NowMs(), lastSend = start, lastTitle = 0;
+    while (g_running && !g_lost && (frame >= g_haveRemote.size() || !g_haveRemote[frame]))
     {
         g_cv.wait_for(lock, std::chrono::milliseconds(8));
         uint64_t now = NowMs();
@@ -811,12 +813,43 @@ void NetplayExchange(uint32_t frame, const NetInput& local, NetInput out[2])
             lastSend = now;
             SendInputsLocked();  // lost packets: the other PC asks again with its ack
         }
-        if (now - start > 20000)
+        // After a second, the title bar says what is going on.
+        if (now - start > 1000 && now - lastTitle > 500)
         {
-            LOG("[online] no controls from the other player for 20 s: playing on alone");
-            g_running = false;
-            break;
+            lastTitle = now;
+            std::wstring t = L"Dead Space: Extraction \u00b7 esperando al otro jugador\u2026 (" +
+                std::to_wstring((now - start) / 1000) + L" s)";
+            lock.unlock();
+            if (HWND w = (HWND)VideoGetWindow())
+                SetWindowTextW(w, t.c_str());
+            lock.lock();
         }
+        if (now - start > 15000)
+        {
+            LOG("[online] no controls from the other player for 15 s");
+            g_lost = true;
+        }
+    }
+    if (g_lost)
+    {
+        // The session is over: say so and go back to the launcher (a new process).
+        lock.unlock();
+        LOG("[online] connection lost: back to the launcher");
+        NetplayShutdown();
+        MessageBoxW((HWND)VideoGetWindow(), L"Se perdi\u00f3 la conexi\u00f3n con el otro jugador.\n\nSe vuelve al launcher.",
+            L"Dead Space: Extraction \u00b7 En l\u00ednea", MB_ICONINFORMATION | MB_TOPMOST);
+        wchar_t exe[MAX_PATH];
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring cmd = L"\"" + std::wstring(exe) + L"\" --launcher";
+        STARTUPINFOW si{ sizeof(si) };
+        PROCESS_INFORMATION pi{};
+        if (CreateProcessW(exe, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi))
+        {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+        fflush(stderr);
+        TerminateProcess(GetCurrentProcess(), 0);
     }
     if (frame < g_haveRemote.size() && g_haveRemote[frame])
         out[1 - me] = g_remote[frame];
@@ -842,13 +875,22 @@ void NetplayReportHash(uint32_t frame, uint64_t hash)
     Send(b);
 }
 
+void NetplayShutdown()
+{
+    if (!g_active || !g_havePeer)
+        return;
+    std::lock_guard lock(g_m);
+    for (int i = 0; i < 3; i++)  // UDP: a few times so one gets through
+        Send(Header(kBye));
+}
+
 std::wstring NetplayStatusText()
 {
     if (!g_active)
         return L"";
     std::lock_guard lock(g_m);
     std::wstring t = g_host ? L"En línea · anfitrión (J1)" : L"En línea · invitado (J2)";
-    if (!g_running)
+    if (g_lost)
         t += L" · conexión perdida";
     if (g_desync)
         t += L" · ¡DESINCRONIZADO! (fotograma " + std::to_wstring(g_desyncFrame) + L")";

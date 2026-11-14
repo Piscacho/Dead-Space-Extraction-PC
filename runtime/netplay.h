@@ -30,5 +30,7 @@ bool NetplayHostWide();
 void NetplayExchange(uint32_t frame, const NetInput& local, NetInput out[2]);
 // Desync check: both PCs report a memory hash every so often; a difference is reported.
 void NetplayReportHash(uint32_t frame, uint64_t hash);
+// Tells the other PC we are leaving (closing the window, quitting).
+void NetplayShutdown();
 // Text for the window title ("Online · host · 45 ms"), empty when offline.
 std::wstring NetplayStatusText();

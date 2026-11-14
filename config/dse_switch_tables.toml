@@ -2255,25 +2255,6 @@ labels = [
     0x8019D7F4,
 ]
 [[switch]]
-base = 0x8019D774
-r = 0
-shift = 2
-default = 0x8019D804
-labels = [
-    0x8019D778,
-    0x8019D768,
-    0x8019D804,
-    0x8019D788,
-    0x8019D804,
-    0x8019D798,
-    0x8019D7A8,
-    0x8019D7B8,
-    0x8019D7C4,
-    0x8019D7D4,
-    0x8019D7E4,
-    0x8019D7F4,
-]
-[[switch]]
 base = 0x8019D848
 r = 0
 shift = 2

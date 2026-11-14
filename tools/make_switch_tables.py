@@ -79,7 +79,9 @@ def main():
                 # Bounds check before the bgt: index register and last case.
                 boundReg, bound = int(regs[0][1:]), int(regs[1], 0)
                 boundBack = back
-            if op in ("blr", "b") and back > 1:
+            # Another jump ends the block: a bctr right after a switch's own bctr (a virtual call
+            # through r12, say) must not borrow that switch's table.
+            if op in ("blr", "b", "bctr") and back > 1:
                 break
         # The index register can be overwritten between the scaling and the bctr (for example
         # rlwinm r9,r3,2 ; lwzx r3,r3,r9): then switch on the scaled register instead.
@@ -101,6 +103,11 @@ def main():
                 if op2 and not op2.startswith(("st", "cmp", "mt", "b")) and r2 and r2[0] == f"r{idx}":
                     idx, shift = int(lwzx[2][1:]), 2
                     break
+        # The bctr must jump to what the lwzx loaded: mtctr of the lwzx's target register.
+        op1, args1 = instrs.get(addr - 4, ("", ""))
+        if lwzx is None or op1 != "mtctr" or args1.strip() != lwzx[0]:
+            missed.append(addr)
+            continue
         if table in tables:
             taddr, tsize = tables[table]
             count = tsize // 4

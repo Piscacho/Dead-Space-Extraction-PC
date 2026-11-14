@@ -217,8 +217,12 @@ static LONG CALLBACK CrashHandler(EXCEPTION_POINTERS* e)
     LOG("[crash] guest base %p, image base 0x%llX", (void*)g_base, (unsigned long long)mod);
     // Host stack by function name (guest functions appear as sub_XXXXXXXX).
     CONTEXT c = *e->ContextRecord;
+    // A stack overflow is usually endless recursion: show more levels to see the cycle.
+    bool overflow = r->ExceptionCode == EXCEPTION_STACK_OVERFLOW;
+    if (overflow)
+        LOG("[crash] STACK OVERFLOW (endless recursion?)");
     std::string line = "[crash] stack:";
-    for (int f = 0; f < 16 && c.Rip; f++)
+    for (int f = 0; f < (overflow ? 48 : 16) && c.Rip; f++)
     {
         line += " " + HostSymbol(c.Rip);
         DWORD64 imageBase;
@@ -463,6 +467,10 @@ int main(int argc, char** argv)
             freopen("NUL", "w", stderr);
     }
     AddVectoredExceptionHandler(1, CrashHandler);
+    // Room on the stack for the crash report even after a stack overflow (it applies to the
+    // guest threads' fibers too: the guarantee belongs to the host thread).
+    ULONG guarantee = 256 * 1024;
+    SetThreadStackGuarantee(&guarantee);
 
     // The launcher first (launcher.cpp), unless --jugar, an automated test (DSE_AUTOSCRIPT /
     // DSE_AUTOPRESS) or mostrar_launcher=0; --launcher or holding Shift always shows it.

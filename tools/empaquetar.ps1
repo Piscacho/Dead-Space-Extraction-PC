@@ -1,9 +1,9 @@
-# Prepara una carpeta lista para jugar en otro PC: dist\DeadSpaceExtraction\ con DSE.exe,
+﻿# Prepara una carpeta lista para jugar en otro PC: dist\DeadSpaceExtraction\ con DSE.exe,
 # las imágenes del launcher y un dse.ini sin la carpeta del juego (el launcher la pide).
 #
-# OJO: DSE.exe contiene el código del juego recompilado. Es para uso propio: quien lo use
-# necesita su propia copia del disco extraída (carpeta DATA con sys\main.dol). No lo
-# compartas públicamente.
+# Con -Version 0.9.0 también crea dist\Dead-Space-Extraction-PC-v0.9.0-windows.zip y su .sha256
+# para la release. Quien lo use necesita su propia copia del disco extraída (sys\main.dol).
+param([string]$Version)
 $root = Split-Path -Parent $PSScriptRoot
 $build = Join-Path $root "project\build"
 $out = Join-Path $root "dist\DeadSpaceExtraction"
@@ -39,3 +39,12 @@ Requisitos: Windows 10/11 de 64 bits y una tarjeta gráfica con DirectX 12.
 "@ | Set-Content -Encoding utf8 (Join-Path $out "LEEME.txt")
 $size = (Get-ChildItem $out -Recurse | Measure-Object Length -Sum).Sum / 1MB
 "Listo: $out ({0:N0} MB)" -f $size
+Copy-Item (Join-Path $root "LICENSE"), (Join-Path $root "THIRD-PARTY-NOTICES.txt") $out
+if ($Version) {
+    $zip = Join-Path $root "dist\Dead-Space-Extraction-PC-v$Version-windows.zip"
+    if (Test-Path $zip) { Remove-Item $zip }
+    Compress-Archive -Path $out -DestinationPath $zip
+    $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+    "$hash  $(Split-Path -Leaf $zip)" | Set-Content -Encoding ascii "$zip.sha256"
+    "Zip: $zip`nSHA-256: $hash"
+}

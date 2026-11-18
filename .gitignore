@@ -3,8 +3,6 @@
 /ppc/
 /logs/
 /recomp.log
-# XenonRecomp tiene su propio repositorio; nuestros cambios están en xenonrecomp_dse.diff
-/XenonRecomp/
 # Compilación
 /project/build/*
 !/project/build/launcher/
@@ -12,3 +10,7 @@
 # Capturas de pruebas sueltas
 /*.png
 /dist/
+# Imágenes del launcher (arte de terceros, van solo en la release) y acceso directo local
+/project/build/launcher/*.jpg
+/project/build/launcher/*.png
+*.lnk

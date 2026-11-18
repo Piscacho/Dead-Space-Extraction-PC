@@ -1118,7 +1118,7 @@ index 534e503..28e241a 100644
      bool nonArgumentRegistersAsLocalVariables = false;
      bool nonVolatileRegistersAsLocalVariables = false;
 diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
-index 31a86cd..4898a39 100644
+index 31a86cd..66d3a98 100644
 --- a/XenonUtils/ppc_context.h
 +++ b/XenonUtils/ppc_context.h
 @@ -11,6 +11,7 @@
@@ -1129,7 +1129,7 @@ index 31a86cd..4898a39 100644
  
  #include <x86/avx.h>
  #include <x86/sse.h>
-@@ -542,8 +543,118 @@ struct alignas(0x40) PPCContext
+@@ -542,8 +543,127 @@ struct alignas(0x40) PPCContext
      PPCVRegister v126;
      PPCVRegister v127;
  #endif
@@ -1170,6 +1170,15 @@ index 31a86cd..4898a39 100644
 +    return (type == 4 || type == 6) ? 1 : (type == 5 || type == 7) ? 2 : 4;
 +}
 +
++// 2^k as an exact double (|k| <= 63 here): same result as std::ldexp, much cheaper.
++inline double ppc_pow2(int32_t k)
++{
++    uint64_t bits = uint64_t(1023 + k) << 52;
++    double d;
++    memcpy(&d, &bits, sizeof(d));
++    return d;
++}
++
 +inline double ppc_psq_load(uint8_t* base, uint32_t ea, uint32_t gqr, uint32_t index)
 +{
 +    uint32_t type = (gqr >> 16) & 7;
@@ -1177,10 +1186,10 @@ index 31a86cd..4898a39 100644
 +    uint32_t addr = ea + index * ppc_gqr_size(type);
 +    switch (type)
 +    {
-+    case 4: return std::ldexp(double(PPC_LOAD_U8(addr)), -scale);
-+    case 5: return std::ldexp(double(PPC_LOAD_U16(addr)), -scale);
-+    case 6: return std::ldexp(double(int8_t(PPC_LOAD_U8(addr))), -scale);
-+    case 7: return std::ldexp(double(int16_t(PPC_LOAD_U16(addr))), -scale);
++    case 4: return double(PPC_LOAD_U8(addr)) * ppc_pow2(-scale);
++    case 5: return double(PPC_LOAD_U16(addr)) * ppc_pow2(-scale);
++    case 6: return double(int8_t(PPC_LOAD_U8(addr))) * ppc_pow2(-scale);
++    case 7: return double(int16_t(PPC_LOAD_U16(addr))) * ppc_pow2(-scale);
 +    default:
 +    {
 +        uint32_t bits = PPC_LOAD_U32(addr);
@@ -1194,7 +1203,7 @@ index 31a86cd..4898a39 100644
 +template<typename T>
 +inline T ppc_psq_quantize(double value, int32_t scale)
 +{
-+    double v = std::ldexp(value, scale);
++    double v = value * ppc_pow2(scale);
 +    double lo = double(std::numeric_limits<T>::min());
 +    double hi = double(std::numeric_limits<T>::max());
 +    v = v < lo ? lo : (v > hi ? hi : v);

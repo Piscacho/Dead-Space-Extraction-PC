@@ -1,0 +1,17 @@
+Componentes de terceros / Third-party components
+================================================
+
+XenonRecomp (hedge-dev and contributors)
+  Licencia: MIT. Recompilador de PowerPC a C++ usado para generar el codigo del juego (con cambios
+  para Gekko en xenonrecomp_dse.diff); incluye SIMDe (MIT), que usa el codigo generado.
+  https://github.com/hedge-dev/XenonRecomp
+
+Dolphin (Dolphin Emulator Project)
+  Licencia: GPL-2.0-or-later. Usado solo como documentacion y referencia del comportamiento del
+  hardware de la Wii (GX, DSP/AX, IOS); este proyecto no copia su codigo.
+  https://github.com/dolphin-emu/dolphin
+
+Imagenes del launcher (solo en la release, carpeta launcher\)
+  De SteamGridDB, con sus autores en launcher\CREDITOS.txt. Dead Space es una marca de
+  Electronic Arts; el arte del juego pertenece a sus propietarios.
+  https://www.steamgriddb.com/

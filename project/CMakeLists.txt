@@ -16,6 +16,7 @@ target_compile_options(DSERecompLib PRIVATE ${DSE_PPC_OPT} -fno-strict-aliasing 
 
 add_executable(DSE
     ${RECOMP_ROOT}/runtime/main.cpp
+    ${RECOMP_ROOT}/runtime/updater.cpp
     ${RECOMP_ROOT}/runtime/boot.cpp
     ${RECOMP_ROOT}/runtime/hooks.cpp
     ${RECOMP_ROOT}/runtime/ios.cpp

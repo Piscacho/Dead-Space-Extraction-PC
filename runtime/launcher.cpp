@@ -20,13 +20,22 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <functional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "msimg32.lib")
+
+// updater.cpp
+struct UpdateInfo { bool ok = false, newer = false; std::string error, tag, zipUrl, notes, page; };
+UpdateInfo UpdateCheck(const std::string& repo);
+bool UpdateInstall(const UpdateInfo& u, const std::vector<std::wstring>& preserve, const std::function<void(int, int)>& progress, std::string& err);
+bool UpdaterRelaunch();
+const char* AppVersion();
 
 namespace
 {
@@ -43,7 +52,6 @@ const COLORREF kMuted = RGB(110, 145, 160);
 const COLORREF kRed = RGB(220, 60, 45);
 const COLORREF kPlayText = RGB(4, 16, 22);
 
-const wchar_t* kVersion = L"1.0";
 const wchar_t* kAuthor = L"Piscacho";
 
 enum Page { kHome, kGraphics, kControls, kAudio, kOnline, kAdvanced, kPages };
@@ -52,7 +60,7 @@ const wchar_t* kPageNames[kPages] = { L"INICIO", L"GRÁFICOS", L"CONTROLES", L"A
 // Hit-test ids.
 enum : int
 {
-    kIdPlay = 1, kIdSave, kIdBrowse, kIdOpenLogs, kIdOpenSaves, kIdResetControls, kIdVolume,
+    kIdPlay = 1, kIdSave, kIdBrowse, kIdOpenLogs, kIdOpenSaves, kIdResetControls, kIdVolume, kIdUpdate,
     kIdPageBase = 100, kIdChoiceBase = 1000, kIdToggleBase = 2000, kIdBindBase = 4000, kIdTextBase = 5000,
 };
 
@@ -145,6 +153,9 @@ struct State
     int dragVolume = false;
     int editing = -1;          // text setting being typed
     std::wstring status;
+    UpdateInfo upd;            // last update check (updater.cpp)
+    bool updBusy = false;
+    std::wstring updText;
     HBITMAP banner = nullptr;
     int bannerW = 0, bannerH = 0;
     IWICImagingFactory* wic = nullptr;
@@ -764,9 +775,14 @@ void PaintAdvanced(HDC dc, RECT area)
         ChoiceRow(dc, x, y, w, kChoiceP2Pad);
     y = Section(dc, x, y + S(6), w, L"LAUNCHER");
     ToggleRow(dc, x, y, w, kToggleLauncher);
-    y = Section(dc, x, y + S(6), w, L"CARPETAS");
+    y = Section(dc, x, y + S(6), w, L"CARPETAS Y ACTUALIZACIONES");
     Button(dc, RECT{ x, y, x + S(220), y + S(36) }, L"PARTIDAS GUARDADAS", kIdOpenSaves);
     Button(dc, RECT{ x + S(236), y, x + S(456), y + S(36) }, L"REGISTRO (LOG)", kIdOpenLogs);
+    Button(dc, RECT{ x + w - S(240), y, x + w, y + S(36) },
+        g.upd.newer ? L"INSTALAR " + Wide(g.upd.tag) : std::wstring(L"BUSCAR ACTUALIZACIÓN"), kIdUpdate);
+    RECT ut{ x, y + S(44), x + w, y + S(66) };
+    Text(dc, g.updText.empty() ? L"Versión instalada: v" + Wide(AppVersion()) : g.updText, ut, g.upd.newer ? kCyan : kMuted,
+        g.smallFont, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 }
 
 void Paint(HDC dc, RECT rc)
@@ -802,7 +818,7 @@ void Paint(HDC dc, RECT rc)
     RECT t3{ S(24), S(110), side - S(10), S(134) };
     Text(dc, L"PORT PC", t3, kCyan, g.heading, DT_LEFT | DT_VCENTER | DT_SINGLELINE, S(4));
     RECT t4{ S(24), S(134), side - S(10), S(154) };
-    Text(dc, std::wstring(L"por ") + kAuthor + L"  ·  v" + kVersion, t4, kMuted, g.smallFont);
+    Text(dc, std::wstring(L"por ") + kAuthor + L"  ·  v" + Wide(AppVersion()), t4, kMuted, g.smallFont);
 
     int y = S(190);
     for (int p = 0; p < kPages; p++)
@@ -879,6 +895,94 @@ void Paint(HDC dc, RECT rc)
 }
 
 // --- Actions ---------------------------------------------------------------------------
+// Updates: updater.cpp runs on a thread; results come back as window messages.
+enum { WM_UPD_CHECKED = WM_APP + 1, WM_UPD_PROGRESS, WM_UPD_INSTALLED };
+const char* kRepo = "Piscacho/Dead-Space-Extraction-PC";
+
+void StartUpdateInstall();
+
+void StartUpdateCheck(bool automatic)
+{
+    if (g.updBusy)
+        return;
+    g.updBusy = true;
+    if (!automatic)
+        g.updText = L"Buscando actualizaciones…";
+    HWND wnd = g.wnd;
+    std::thread([wnd, automatic] {
+        auto* u = new UpdateInfo(UpdateCheck(kRepo));
+        if (!PostMessageW(wnd, WM_UPD_CHECKED, automatic, (LPARAM)u))
+            delete u;
+    }).detach();
+}
+
+void OnUpdateChecked(UpdateInfo* u, bool automatic)
+{
+    g.updBusy = false;
+    g.upd = *u;
+    delete u;
+    std::wstring cur = Wide(AppVersion());
+    if (!g.upd.ok)
+    {
+        if (!automatic)
+            g.updText = L"No se pudo comprobar: " + Wide(g.upd.error);
+        return;
+    }
+    if (!g.upd.newer)
+    {
+        if (!automatic)
+            g.updText = L"Tienes la última versión (v" + cur + L").";
+        return;
+    }
+    g.updText = L"Nueva versión " + Wide(g.upd.tag) + L" disponible (tienes v" + cur + L").";
+    g.status = L"Hay una versión nueva: " + Wide(g.upd.tag) + L" (AVANZADO → ACTUALIZACIONES).";
+    if (getenv("DSE_UPDATE_AUTOYES"))  // tests: install without asking
+        StartUpdateInstall();
+}
+
+void StartUpdateInstall()
+{
+    std::wstring q = L"¿Descargar e instalar " + Wide(g.upd.tag) + L"?\n\nSe conservan dse.ini, las partidas y el registro.";
+    if (!g.upd.notes.empty())
+        q += L"\n\nNovedades:\n" + Wide(g.upd.notes.substr(0, 600));
+    bool ask = !getenv("DSE_UPDATE_AUTOYES");
+    if (g.updBusy || (ask && MessageBoxW(g.wnd, q.c_str(), L"Actualización", MB_YESNO | MB_ICONQUESTION) != IDYES))
+        return;
+    g.updBusy = true;
+    g.updText = L"Descargando…";
+    HWND wnd = g.wnd;
+    UpdateInfo u = g.upd;
+    std::thread([wnd, u] {
+        std::string err;
+        bool ok = UpdateInstall(u, {}, [wnd](int pct, int phase) { PostMessageW(wnd, WM_UPD_PROGRESS, pct, phase); }, err);
+        PostMessageW(wnd, WM_UPD_INSTALLED, ok, (LPARAM)new std::string(err));
+    }).detach();
+}
+
+void OnUpdateInstalled(bool ok, std::string* err)
+{
+    g.updBusy = false;
+    if (!ok)
+    {
+        g.updText = L"No se pudo actualizar: " + Wide(*err);
+        delete err;
+        return;
+    }
+    delete err;
+    if (g.dirty)
+        g.ini.Save();  // keep what was changed in the window
+    if (!getenv("DSE_UPDATE_AUTOYES"))
+        MessageBoxW(g.wnd, (L"Actualizado a " + Wide(g.upd.tag) + L". El launcher se abrirá de nuevo.").c_str(), L"Actualización",
+        MB_ICONINFORMATION);
+    if (UpdaterRelaunch())
+    {
+        g.done = true;
+        DestroyWindow(g.wnd);
+    }
+    else
+        g.updText = L"Actualizado. Cierra y vuelve a abrir el juego.";
+}
+
 bool Save()
 {
     if (!g.ini.Save())
@@ -1000,6 +1104,12 @@ void Click(int id, bool right)
         g.done = true;
         break;
     case kIdSave: Save(); break;
+    case kIdUpdate:
+        if (g.upd.newer)
+            StartUpdateInstall();
+        else
+            StartUpdateCheck(false);
+        break;
     case kIdBrowse: BrowseFolder(); break;
     case kIdOpenLogs: ShellExecuteW(nullptr, L"open", Wide(LogFolder()).c_str(), nullptr, nullptr, SW_SHOWNORMAL); break;
     case kIdOpenSaves: OpenFolder("user\\nand"); break;
@@ -1208,6 +1318,19 @@ LRESULT CALLBACK LauncherProc(HWND h, UINT m, WPARAM w, LPARAM l)
             return 0;
         }
         break;
+    case WM_UPD_CHECKED:
+        OnUpdateChecked((UpdateInfo*)l, w != 0);
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    case WM_UPD_PROGRESS:
+        g.updText = l == 0 ? L"Descargando… " + std::to_wstring(w) + L"%" : (l == 1 ? L"Descomprimiendo…" : L"Instalando…");
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    case WM_UPD_INSTALLED:
+        OnUpdateInstalled(w != 0, (std::string*)l);
+        if (IsWindow(h))
+            InvalidateRect(h, nullptr, FALSE);
+        return 0;
     case WM_TIMER:
         PollPadCapture();
         if (g.editing >= 0)  // the caret blinks
@@ -1318,6 +1441,8 @@ bool LauncherRun()
         g.page = Page(std::clamp(atoi(page), 0, int(kPages) - 1));
     ShowWindow(g.wnd, SW_SHOW);
     SetTimer(g.wnd, 1, 30, nullptr);
+    if (IniValue("buscar_actualizaciones", "1") != "0")  // quietly; only says something when there is a new version
+        StartUpdateCheck(true);
 
     MSG msg;
     while (!g.done && GetMessageW(&msg, nullptr, 0, 0) > 0)

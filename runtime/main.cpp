@@ -4,6 +4,7 @@
 #include "config.h"
 #include "netplay.h"
 bool LauncherRun();  // launcher.cpp
+void UpdaterCleanup();  // updater.cpp
 #include <windows.h>
 #include <exception>
 #include <csignal>
@@ -531,6 +532,7 @@ int main(int argc, char** argv)
         else
             dolArg = a;
     }
+    UpdaterCleanup();  // the *.old left by an update
     bool automated = getenv("DSE_AUTOSCRIPT") || getenv("DSE_AUTOPRESS");
     bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
     if (forceLauncher || shift || (!play && !automated && ConfigBool("mostrar_launcher", true)))

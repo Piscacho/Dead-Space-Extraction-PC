@@ -35,6 +35,8 @@ F = golpe (agitar Nunchuk), G = cargar la luz, R = fuego alternativo, WASD = sti
 Intro = pausa. Todo se cambia en CONTROLES. También funciona con mando de Xbox.
 
 Las partidas se guardan en user\nand y el registro en logs\juego.log, junto a DSE.exe.
+Actualizar: el launcher avisa al abrirlo si hay una versión nueva; se instala en AVANZADO >
+BUSCAR ACTUALIZACIÓN y conserva dse.ini, las partidas y el registro.
 Requisitos: Windows 10/11 de 64 bits y una tarjeta gráfica con DirectX 12.
 "@ | Set-Content -Encoding utf8 (Join-Path $out "LEEME.txt")
 $size = (Get-ChildItem $out -Recurse | Measure-Object Length -Sum).Sum / 1MB

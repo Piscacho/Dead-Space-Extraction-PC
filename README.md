@@ -28,6 +28,8 @@ Recompilación estática para PC de **Dead Space: Extraction** (Wii, RZJE69, EE.
 - **En línea (experimental)**: cooperativo para 2 sin servidores. Los dos PCs ejecutan el juego y solo se envían
   los controles; los dos necesitáis el mismo `DSE.exe` y vuestra copia del juego. Pestaña **EN LÍNEA**: uno crea la
   partida (abre el puerto 7350 UDP o usa UPnP) y el otro se une con su dirección.
+- **Actualizar**: el launcher avisa al abrirlo si hay una versión nueva y la instala desde
+  **AVANZADO → BUSCAR ACTUALIZACIÓN**, conservando la configuración, las partidas y el registro.
 
 ### Dónde se guarda todo
 
